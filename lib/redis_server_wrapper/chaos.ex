@@ -250,15 +250,15 @@ defmodule RedisServerWrapper.Chaos do
 
   defp failover_with_auto_force(replica) do
     case Server.run(replica, ["CLUSTER", "FAILOVER"]) do
-      {:error, msg} = error ->
+      {:ok, "ERR" <> _ = msg} ->
         if String.contains?(msg, "Master is down or failed") do
           Server.run(replica, ["CLUSTER", "FAILOVER", "FORCE"])
         else
-          error
+          {:error, msg}
         end
 
-      ok ->
-        ok
+      other ->
+        other
     end
   end
 
