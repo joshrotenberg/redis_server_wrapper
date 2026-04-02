@@ -1,7 +1,7 @@
 defmodule RedisServerWrapper.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/joshrotenberg/redis_server_wrapper"
 
   def project do
