@@ -264,25 +264,23 @@ defmodule RedisServerWrapper.Chaos do
         end
       end)
 
-    if is_nil(cluster_nodes_output) do
-      {:error, :no_responsive_nodes}
+    with output when not is_nil(output) <- cluster_nodes_output,
+         {:ok, {host, port}} <- find_master_addr_for_slot(output, target_slot) do
+      match_master_pid(node_pids, host, port)
     else
-      # Parse CLUSTER NODES to find the master owning target_slot
-      case find_master_addr_for_slot(cluster_nodes_output, target_slot) do
-        {:ok, {host, port}} ->
-          # Match to a Server pid by host:port
-          match =
-            Enum.find(node_pids, fn pid ->
-              info = Server.info(pid)
-              info.host == host && info.port == port
-            end)
-
-          if match, do: {:ok, match}, else: {:error, :master_pid_not_found}
-
-        {:error, _} = error ->
-          error
-      end
+      nil -> {:error, :no_responsive_nodes}
+      {:error, _} = error -> error
     end
+  end
+
+  defp match_master_pid(node_pids, host, port) do
+    match =
+      Enum.find(node_pids, fn pid ->
+        info = Server.info(pid)
+        info.host == host && info.port == port
+      end)
+
+    if match, do: {:ok, match}, else: {:error, :master_pid_not_found}
   end
 
   defp find_master_addr_for_slot(cluster_nodes_output, target_slot) do
@@ -311,19 +309,17 @@ defmodule RedisServerWrapper.Chaos do
   end
 
   defp slot_ranges_contain?(slot_parts, target_slot) do
-    Enum.any?(slot_parts, fn part ->
-      case String.split(part, "-") do
-        [start_str, end_str] ->
-          start = String.to_integer(start_str)
-          stop = String.to_integer(end_str)
-          target_slot >= start && target_slot <= stop
+    Enum.any?(slot_parts, &slot_range_match?(&1, target_slot))
+  end
 
-        [single] ->
-          case Integer.parse(single) do
-            {slot, ""} -> slot == target_slot
-            _ -> false
-          end
-      end
-    end)
+  defp slot_range_match?(part, target_slot) do
+    case String.split(part, "-") do
+      [start_str, end_str] ->
+        target_slot >= String.to_integer(start_str) &&
+          target_slot <= String.to_integer(end_str)
+
+      [single] ->
+        match?({^target_slot, ""}, Integer.parse(single))
+    end
   end
 end
