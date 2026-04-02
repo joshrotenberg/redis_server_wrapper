@@ -322,9 +322,19 @@ defmodule RedisServerWrapper.Sentinel do
     )
   end
 
-  defp start_replicas(0, _base_port, _master_port, _bind, _pw, _rsb, _rcb, _timeout), do: {:ok, []}
+  defp start_replicas(0, _base_port, _master_port, _bind, _pw, _rsb, _rcb, _timeout),
+    do: {:ok, []}
 
-  defp start_replicas(count, base_port, master_port, bind, password, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_replicas(
+         count,
+         base_port,
+         master_port,
+         bind,
+         password,
+         redis_server_bin,
+         redis_cli_bin,
+         timeout
+       ) do
     results =
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
         port = base_port + i
@@ -383,22 +393,31 @@ defmodule RedisServerWrapper.Sentinel do
         node_dir = Path.join(sentinel_dir, "sentinel-#{port}")
         File.mkdir_p!(node_dir)
 
-        conf_content = generate_sentinel_conf(
-          port,
-          bind,
-          node_dir,
-          master_name,
-          master_port,
-          password,
-          quorum,
-          down_after_ms,
-          failover_timeout_ms
-        )
+        conf_content =
+          generate_sentinel_conf(
+            port,
+            bind,
+            node_dir,
+            master_name,
+            master_port,
+            password,
+            quorum,
+            down_after_ms,
+            failover_timeout_ms
+          )
 
         conf_path = Path.join(node_dir, "sentinel.conf")
         File.write!(conf_path, conf_content)
 
-        case start_sentinel_process(redis_server_bin, conf_path, node_dir, redis_cli_bin, bind, port, timeout) do
+        case start_sentinel_process(
+               redis_server_bin,
+               conf_path,
+               node_dir,
+               redis_cli_bin,
+               bind,
+               port,
+               timeout
+             ) do
           {:ok, os_pid} ->
             {:cont, {:ok, acc ++ [os_pid]}}
 
@@ -418,7 +437,17 @@ defmodule RedisServerWrapper.Sentinel do
     end
   end
 
-  defp generate_sentinel_conf(port, bind, dir, master_name, master_port, password, quorum, down_after_ms, failover_timeout_ms) do
+  defp generate_sentinel_conf(
+         port,
+         bind,
+         dir,
+         master_name,
+         master_port,
+         password,
+         quorum,
+         down_after_ms,
+         failover_timeout_ms
+       ) do
     lines = [
       "port #{port}",
       "bind #{bind}",
@@ -442,7 +471,15 @@ defmodule RedisServerWrapper.Sentinel do
     Enum.join(lines, "\n") <> "\n"
   end
 
-  defp start_sentinel_process(redis_server_bin, conf_path, node_dir, redis_cli_bin, bind, port, timeout) do
+  defp start_sentinel_process(
+         redis_server_bin,
+         conf_path,
+         node_dir,
+         redis_cli_bin,
+         bind,
+         port,
+         timeout
+       ) do
     case System.cmd(redis_server_bin, [conf_path, "--sentinel"], stderr_to_stdout: true) do
       {_output, 0} ->
         # Wait for sentinel to be ready

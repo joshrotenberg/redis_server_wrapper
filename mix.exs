@@ -1,15 +1,22 @@
 defmodule RedisServerWrapper.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/joshrotenberg/redis_server_wrapper"
+
   def project do
     [
       app: :redis_server_wrapper,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Elixir wrapper for redis-server and redis-cli with GenServer process management",
-      package: package()
+      description:
+        "Manage redis-server processes from Elixir -- single instances, clusters, and sentinel topologies with GenServer lifecycle management",
+      package: package(),
+      docs: docs(),
+      source_url: @source_url,
+      homepage_url: @source_url
     ]
   end
 
@@ -21,13 +28,25 @@ defmodule RedisServerWrapper.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
+    ]
   end
 
   defp package do
     [
       licenses: ["MIT", "Apache-2.0"],
-      links: %{}
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "LICENSE"],
+      source_ref: "v#{@version}",
+      source_url: @source_url
     ]
   end
 end

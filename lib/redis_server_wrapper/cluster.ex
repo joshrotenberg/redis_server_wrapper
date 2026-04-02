@@ -127,7 +127,16 @@ defmodule RedisServerWrapper.Cluster do
     Process.sleep(500)
 
     # Start each node as a Server GenServer
-    case start_nodes(ports, bind, password, redis_server_bin, redis_cli_bin, timeout, cluster_node_timeout, extra) do
+    case start_nodes(
+           ports,
+           bind,
+           password,
+           redis_server_bin,
+           redis_cli_bin,
+           timeout,
+           cluster_node_timeout,
+           extra
+         ) do
       {:ok, node_pids} ->
         # Form the cluster
         seed_cli = Cli.new(bin: redis_cli_bin, host: bind, port: base_port, password: password)
@@ -243,7 +252,9 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   def terminate(_reason, state) do
-    Logger.debug("RedisServerWrapper.Cluster terminating, stopping #{length(state.node_pids)} nodes")
+    Logger.debug(
+      "RedisServerWrapper.Cluster terminating, stopping #{length(state.node_pids)} nodes"
+    )
 
     Enum.each(state.node_pids, fn pid ->
       try do
@@ -260,24 +271,36 @@ defmodule RedisServerWrapper.Cluster do
   # Internal
   # -------------------------------------------------------------------
 
-  defp start_nodes(ports, bind, password, redis_server_bin, redis_cli_bin, timeout, cluster_node_timeout, extra) do
+  defp start_nodes(
+         ports,
+         bind,
+         password,
+         redis_server_bin,
+         redis_cli_bin,
+         timeout,
+         cluster_node_timeout,
+         extra
+       ) do
     results =
       Enum.reduce_while(ports, {:ok, []}, fn port, {:ok, acc} ->
-        opts = [
-          port: port,
-          bind: bind,
-          password: password,
-          redis_server_bin: redis_server_bin,
-          redis_cli_bin: redis_cli_bin,
-          timeout: timeout,
-          cluster_enabled: true,
-          cluster_config_file: "nodes-#{port}.conf",
-          cluster_node_timeout: cluster_node_timeout,
-          save: :disabled
-        ] ++ extra_to_opts(extra)
+        opts =
+          [
+            port: port,
+            bind: bind,
+            password: password,
+            redis_server_bin: redis_server_bin,
+            redis_cli_bin: redis_cli_bin,
+            timeout: timeout,
+            cluster_enabled: true,
+            cluster_config_file: "nodes-#{port}.conf",
+            cluster_node_timeout: cluster_node_timeout,
+            save: :disabled
+          ] ++ extra_to_opts(extra)
 
         case Server.start_link(opts) do
-          {:ok, pid} -> {:cont, {:ok, acc ++ [pid]}}
+          {:ok, pid} ->
+            {:cont, {:ok, acc ++ [pid]}}
+
           {:error, reason} ->
             # Rollback already-started nodes
             Enum.each(acc, &Server.stop/1)
