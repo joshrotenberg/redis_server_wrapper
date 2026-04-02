@@ -229,6 +229,7 @@ defmodule RedisServerWrapper.Manager do
           # We need to inspect the GenServer state for the OS pids
           # For now, collect what we can from the sentinel info
           replica_base_port = master_port + 1
+
           all_redis_ports =
             [master_port] ++
               Enum.map(0..(num_replicas - 1), &(replica_base_port + &1))
@@ -239,7 +240,14 @@ defmodule RedisServerWrapper.Manager do
           all_pids =
             (all_redis_ports
              |> Enum.map(fn port ->
-               pidfile = Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{port}", "redis.pid"])
+               pidfile =
+                 Path.join([
+                   System.tmp_dir!(),
+                   "redis-server-wrapper",
+                   "node-#{port}",
+                   "redis.pid"
+                 ])
+
                read_pidfile(pidfile)
              end)) ++
               (sentinel_ports
@@ -612,7 +620,10 @@ defmodule RedisServerWrapper.Manager do
   defp print_instance_short(instance) do
     status = check_status(instance)
     status_str = if status == :running, do: "running", else: "stopped"
-    IO.puts("  #{instance.name}\t#{instance.type}\t#{status_str}\t#{Enum.join(instance.ports, ",")}")
+
+    IO.puts(
+      "  #{instance.name}\t#{instance.type}\t#{status_str}\t#{Enum.join(instance.ports, ",")}"
+    )
   end
 
   defp print_instance_detail(instance) do

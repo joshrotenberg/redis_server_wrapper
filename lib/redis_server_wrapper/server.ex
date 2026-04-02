@@ -180,7 +180,10 @@ defmodule RedisServerWrapper.Server do
   end
 
   def terminate(_reason, state) do
-    Logger.debug("RedisServerWrapper.Server terminating, sending SHUTDOWN NOSAVE to port #{state.config.port}")
+    Logger.debug(
+      "RedisServerWrapper.Server terminating, sending SHUTDOWN NOSAVE to port #{state.config.port}"
+    )
+
     Cli.shutdown(state.cli)
     # Give it a moment to shut down
     Process.sleep(500)
@@ -218,12 +221,13 @@ defmodule RedisServerWrapper.Server do
     case System.cmd(redis_server_bin, [conf_path], stderr_to_stdout: true) do
       {_output, 0} ->
         # Read PID from pidfile
-        cli = Cli.new(
-          bin: redis_cli_bin,
-          host: config.bind,
-          port: config.port,
-          password: config.password
-        )
+        cli =
+          Cli.new(
+            bin: redis_cli_bin,
+            host: config.bind,
+            port: config.port,
+            password: config.password
+          )
 
         case Cli.wait_for_ready(cli, timeout) do
           :ok ->
