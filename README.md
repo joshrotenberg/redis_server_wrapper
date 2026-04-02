@@ -119,12 +119,57 @@ RedisServerWrapper.start_server(
 )
 ```
 
+### Chaos / Fault Injection
+
+The `Chaos` module provides fault injection primitives for testing resilience:
+
+```elixir
+alias RedisServerWrapper.{Chaos, Cluster, Server}
+
+{:ok, cluster} = RedisServerWrapper.start_cluster(
+  masters: 3,
+  replicas_per_master: 1,
+  base_port: 7000
+)
+
+# Kill the master owning a key's hash slot
+{:ok, killed} = Chaos.kill_master(cluster, "user:123")
+
+# Kill by slot number
+{:ok, killed} = Chaos.kill_master(cluster, 5000)
+
+# Freeze a node (SIGSTOP) and resume later
+{:ok, os_pid} = Chaos.freeze_node(server)
+# ... test timeout/retry behavior ...
+Chaos.resume_node(os_pid)
+
+# Freeze with automatic resume after a duration
+Chaos.pause_node(server, 5_000)
+
+# Simulate a network partition
+nodes = Cluster.nodes(cluster)
+{active, isolated} = Enum.split(nodes, 2)
+{:ok, frozen_pids} = Chaos.partition(cluster, [active, isolated])
+
+# Recover all frozen nodes
+Chaos.recover(frozen_pids)
+
+# Other tools
+Chaos.slow_down(server, 2_000)        # CLIENT PAUSE
+Chaos.flushall(server)                 # wipe all data
+Chaos.fill_memory(server, 10_000)      # fill with 1KB dummy keys
+Chaos.trigger_save(server)             # force BGSAVE
+Chaos.random_kill(cluster)             # kill a random node
+Chaos.trigger_failover(replica)        # CLUSTER FAILOVER on a replica
+```
+
 ## Use Cases
 
 - **Testing** -- spin up real Redis instances in ExUnit setup/teardown
 - **Development** -- run Redis alongside your app without system services
 - **CI** -- no Docker layer needed, just install redis-server
 - **Cluster/Sentinel testing** -- create full topologies in a single function call
+- **Resilience testing** -- fault injection with the Chaos module (kill nodes, simulate partitions, inject latency)
 
 ## License
 
