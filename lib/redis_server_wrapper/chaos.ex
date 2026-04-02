@@ -229,11 +229,37 @@ defmodule RedisServerWrapper.Chaos do
   Forces a replica to take over from its master via CLUSTER FAILOVER.
 
   The `replica` argument should be a Server GenServer pid for a replica node.
+
+  ## Options
+
+    * `:force` - if `true`, sends `CLUSTER FAILOVER FORCE` directly (default: `false`)
+
+  When `force` is `false`, tries `CLUSTER FAILOVER` first. If the master is down
+  (Redis returns a "Master is down or failed" error), automatically retries with
+  `CLUSTER FAILOVER FORCE`.
   """
-  @spec trigger_failover(GenServer.server()) ::
+  @spec trigger_failover(GenServer.server(), keyword()) ::
           {:ok, String.t()} | {:error, String.t()}
-  def trigger_failover(replica) do
-    Server.run(replica, ["CLUSTER", "FAILOVER"])
+  def trigger_failover(replica, opts \\ []) do
+    if Keyword.get(opts, :force, false) do
+      Server.run(replica, ["CLUSTER", "FAILOVER", "FORCE"])
+    else
+      failover_with_auto_force(replica)
+    end
+  end
+
+  defp failover_with_auto_force(replica) do
+    case Server.run(replica, ["CLUSTER", "FAILOVER"]) do
+      {:error, msg} = error ->
+        if String.contains?(msg, "Master is down or failed") do
+          Server.run(replica, ["CLUSTER", "FAILOVER", "FORCE"])
+        else
+          error
+        end
+
+      ok ->
+        ok
+    end
   end
 
   @doc """
