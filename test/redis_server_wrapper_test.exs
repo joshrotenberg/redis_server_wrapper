@@ -1,7 +1,7 @@
 defmodule RedisServerWrapperTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Config, Cli, Server, Cluster, Sentinel}
+  alias RedisServerWrapper.{Cli, Cluster, Config, Sentinel, Server}
 
   # -------------------------------------------------------------------
   # Config tests (no redis-server needed)
