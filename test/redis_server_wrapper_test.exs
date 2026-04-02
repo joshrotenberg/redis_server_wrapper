@@ -3,6 +3,19 @@ defmodule RedisServerWrapperTest do
 
   alias RedisServerWrapper.{Cli, Cluster, Config, Sentinel, Server}
 
+  defp wait_until(fun, retries \\ 10, delay \\ 1000) do
+    if fun.() do
+      true
+    else
+      if retries > 0 do
+        Process.sleep(delay)
+        wait_until(fun, retries - 1, delay)
+      else
+        false
+      end
+    end
+  end
+
   # -------------------------------------------------------------------
   # Config tests (no redis-server needed)
   # -------------------------------------------------------------------
@@ -206,7 +219,7 @@ defmodule RedisServerWrapperTest do
           sentinels: 3
         )
 
-      assert Sentinel.healthy?(sentinel)
+      assert wait_until(fn -> Sentinel.healthy?(sentinel) end)
 
       info = Sentinel.info(sentinel)
       assert info.master_name == "mymaster"
