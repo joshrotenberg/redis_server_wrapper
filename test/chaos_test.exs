@@ -243,6 +243,80 @@ defmodule RedisServerWrapper.ChaosTest do
     end
   end
 
+  describe "trigger_failover/2" do
+    @tag timeout: 60_000
+    test "falls back to FORCE when master is dead" do
+      {:ok, cluster} =
+        Cluster.start_link(masters: 3, replicas_per_master: 1, base_port: 7350)
+
+      assert Cluster.healthy?(cluster)
+
+      # Kill the master for slot 0
+      {:ok, killed} = Chaos.kill_master(cluster, 0)
+      Process.sleep(1000)
+
+      # Find a replica whose master was killed
+      nodes = Cluster.nodes(cluster)
+      remaining = Enum.reject(nodes, &(&1 == killed))
+
+      replica =
+        Enum.find(remaining, fn pid ->
+          case Server.run(pid, ["CLUSTER", "NODES"]) do
+            {:ok, output} ->
+              # Find this node's own line (contains "myself")
+              output
+              |> String.split("\n", trim: true)
+              |> Enum.any?(fn line ->
+                String.contains?(line, "myself") && String.contains?(line, "slave")
+              end)
+
+            _ ->
+              false
+          end
+        end)
+
+      if replica do
+        # This should auto-fallback to FORCE since master is dead
+        assert {:ok, _} = Chaos.trigger_failover(replica)
+      end
+
+      Cluster.stop(cluster)
+      Process.sleep(1000)
+    end
+
+    @tag timeout: 30_000
+    test "force: true sends FORCE directly" do
+      {:ok, cluster} =
+        Cluster.start_link(masters: 3, replicas_per_master: 1, base_port: 7360)
+
+      assert Cluster.healthy?(cluster)
+
+      # Find any replica node
+      nodes = Cluster.nodes(cluster)
+
+      replica =
+        Enum.find(nodes, fn pid ->
+          case Server.run(pid, ["CLUSTER", "NODES"]) do
+            {:ok, output} ->
+              output
+              |> String.split("\n", trim: true)
+              |> Enum.any?(fn line ->
+                String.contains?(line, "myself") && String.contains?(line, "slave")
+              end)
+
+            _ ->
+              false
+          end
+        end)
+
+      assert replica != nil
+      assert {:ok, _} = Chaos.trigger_failover(replica, force: true)
+
+      Cluster.stop(cluster)
+      Process.sleep(1000)
+    end
+  end
+
   describe "recover/1" do
     @tag timeout: 60_000
     test "resumes all frozen nodes in a cluster" do
