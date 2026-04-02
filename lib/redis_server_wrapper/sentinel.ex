@@ -111,7 +111,7 @@ defmodule RedisServerWrapper.Sentinel do
     num_replicas = Keyword.get(opts, :replicas, 2)
     replica_base_port = Keyword.get(opts, :replica_base_port, master_port + 1)
     num_sentinels = Keyword.get(opts, :sentinels, 3)
-    sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26389)
+    sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     quorum = Keyword.get(opts, :quorum, 2)
     down_after_ms = Keyword.get(opts, :down_after_ms, 5000)
     failover_timeout_ms = Keyword.get(opts, :failover_timeout_ms, 10_000)
@@ -146,20 +146,20 @@ defmodule RedisServerWrapper.Sentinel do
          # Let replication link up
          _ <- Process.sleep(1000),
          {:ok, sentinel_os_pids, sentinel_dir} <-
-           start_sentinels(
-             num_sentinels,
-             sentinel_base_port,
-             master_name,
-             master_port,
-             bind,
-             password,
-             quorum,
-             down_after_ms,
-             failover_timeout_ms,
-             redis_server_bin,
-             redis_cli_bin,
-             timeout
-           ) do
+           start_sentinels(%{
+             count: num_sentinels,
+             base_port: sentinel_base_port,
+             master_name: master_name,
+             master_port: master_port,
+             bind: bind,
+             password: password,
+             quorum: quorum,
+             down_after_ms: down_after_ms,
+             failover_timeout_ms: failover_timeout_ms,
+             redis_server_bin: redis_server_bin,
+             redis_cli_bin: redis_cli_bin,
+             timeout: timeout
+           }) do
       # Wait for sentinel discovery
       Process.sleep(2000)
 
@@ -364,20 +364,9 @@ defmodule RedisServerWrapper.Sentinel do
     results
   end
 
-  defp start_sentinels(
-         count,
-         base_port,
-         master_name,
-         master_port,
-         bind,
-         password,
-         quorum,
-         down_after_ms,
-         failover_timeout_ms,
-         redis_server_bin,
-         redis_cli_bin,
-         timeout
-       ) do
+  defp start_sentinels(opts) do
+    %{count: count, base_port: base_port} = opts
+
     sentinel_dir =
       Path.join([
         System.tmp_dir!(),
@@ -390,43 +379,13 @@ defmodule RedisServerWrapper.Sentinel do
     results =
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
         port = base_port + i
-        node_dir = Path.join(sentinel_dir, "sentinel-#{port}")
-        File.mkdir_p!(node_dir)
 
-        conf_content =
-          generate_sentinel_conf(
-            port,
-            bind,
-            node_dir,
-            master_name,
-            master_port,
-            password,
-            quorum,
-            down_after_ms,
-            failover_timeout_ms
-          )
-
-        conf_path = Path.join(node_dir, "sentinel.conf")
-        File.write!(conf_path, conf_content)
-
-        case start_sentinel_process(
-               redis_server_bin,
-               conf_path,
-               node_dir,
-               redis_cli_bin,
-               bind,
-               port,
-               timeout
-             ) do
+        case start_single_sentinel(opts, sentinel_dir, port) do
           {:ok, os_pid} ->
             {:cont, {:ok, acc ++ [os_pid]}}
 
           {:error, reason} ->
-            # Kill already-started sentinels
-            Enum.each(acc, fn pid ->
-              System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
-            end)
-
+            kill_pids(acc)
             {:halt, {:error, {:sentinel_start_failed, port, reason}}}
         end
       end)
@@ -437,17 +396,36 @@ defmodule RedisServerWrapper.Sentinel do
     end
   end
 
-  defp generate_sentinel_conf(
-         port,
-         bind,
-         dir,
-         master_name,
-         master_port,
-         password,
-         quorum,
-         down_after_ms,
-         failover_timeout_ms
-       ) do
+  defp start_single_sentinel(opts, sentinel_dir, port) do
+    node_dir = Path.join(sentinel_dir, "sentinel-#{port}")
+    File.mkdir_p!(node_dir)
+
+    conf_content = generate_sentinel_conf(opts, node_dir, port)
+    conf_path = Path.join(node_dir, "sentinel.conf")
+    File.write!(conf_path, conf_content)
+
+    start_sentinel_process(
+      opts.redis_server_bin,
+      conf_path,
+      node_dir,
+      opts.redis_cli_bin,
+      opts.bind,
+      port,
+      opts.timeout
+    )
+  end
+
+  defp generate_sentinel_conf(opts, dir, port) do
+    %{
+      bind: bind,
+      master_name: master_name,
+      master_port: master_port,
+      password: password,
+      quorum: quorum,
+      down_after_ms: down_after_ms,
+      failover_timeout_ms: failover_timeout_ms
+    } = opts
+
     lines = [
       "port #{port}",
       "bind #{bind}",
@@ -469,6 +447,12 @@ defmodule RedisServerWrapper.Sentinel do
       end
 
     Enum.join(lines, "\n") <> "\n"
+  end
+
+  defp kill_pids(pids) do
+    Enum.each(pids, fn pid ->
+      System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
+    end)
   end
 
   defp start_sentinel_process(

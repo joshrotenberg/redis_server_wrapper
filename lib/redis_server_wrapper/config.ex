@@ -1,4 +1,6 @@
 defmodule RedisServerWrapper.Config do
+  # Redis has many configuration directives; a flat struct is the clearest mapping.
+  # credo:disable-for-this-file Credo.Check.Warning.StructFieldAmount
   @moduledoc """
   Redis server configuration builder.
 

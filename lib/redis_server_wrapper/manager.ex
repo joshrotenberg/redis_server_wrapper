@@ -19,7 +19,7 @@ defmodule RedisServerWrapper.Manager do
   State is stored at `~/.config/redis-server-wrapper/instances.json`.
   """
 
-  alias RedisServerWrapper.{Cli, Server, Cluster, Sentinel}
+  alias RedisServerWrapper.{Cli, Cluster, Sentinel, Server}
 
   require Logger
 
@@ -206,7 +206,7 @@ defmodule RedisServerWrapper.Manager do
     master_port = Keyword.get(opts, :master_port, 6390)
     num_replicas = Keyword.get(opts, :replicas, 2)
     num_sentinels = Keyword.get(opts, :sentinels, 3)
-    sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26389)
+    sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
 
     if Map.has_key?(state.instances, name) do
@@ -237,27 +237,10 @@ defmodule RedisServerWrapper.Manager do
           sentinel_ports = Enum.map(0..(num_sentinels - 1), &(sentinel_base_port + &1))
 
           # Read OS pids from pidfiles
-          all_pids =
-            (all_redis_ports
-             |> Enum.map(fn port ->
-               pidfile =
-                 Path.join([
-                   System.tmp_dir!(),
-                   "redis-server-wrapper",
-                   "node-#{port}",
-                   "redis.pid"
-                 ])
-
-               read_pidfile(pidfile)
-             end)) ++
-              (sentinel_ports
-               |> Enum.flat_map(fn _port ->
-                 # Sentinel pidfiles are in timestamped dirs, so we rely on
-                 # find_pids_on_ports below instead
-                 []
-               end))
-
-          all_pids = Enum.reject(all_pids, &is_nil/1)
+          redis_pids =
+            all_redis_ports
+            |> Enum.map(&read_node_pidfile/1)
+            |> Enum.reject(&is_nil/1)
 
           # Also grab sentinel PIDs by checking what's listening on sentinel ports
           sentinel_pids = find_pids_on_ports(sentinel_ports)
@@ -271,7 +254,7 @@ defmodule RedisServerWrapper.Manager do
             created_at: DateTime.utc_now() |> DateTime.to_iso8601(),
             bind: bind,
             ports: all_redis_ports ++ sentinel_ports,
-            pids: all_pids ++ sentinel_pids,
+            pids: redis_pids ++ sentinel_pids,
             password: password,
             url: build_url(bind, master_port, password),
             metadata: %{
@@ -438,27 +421,25 @@ defmodule RedisServerWrapper.Manager do
   defp deserialize_state(data) do
     instances =
       (data["instances"] || %{})
-      |> Map.new(fn {name, inst} ->
-        instance = %{
-          name: inst["name"] || name,
-          type: String.to_existing_atom(inst["type"] || "basic"),
-          created_at: inst["created_at"],
-          bind: inst["bind"] || "127.0.0.1",
-          ports: inst["ports"] || [],
-          pids: inst["pids"] || [],
-          password: inst["password"],
-          url: inst["url"] || "",
-          metadata: atomize_keys(inst["metadata"] || %{})
-        }
+      |> Map.new(fn {name, inst} -> {name, deserialize_instance(name, inst)} end)
 
-        {name, instance}
-      end)
-
-    counters =
-      (data["counters"] || %{})
-      |> Map.new(fn {k, v} -> {k, v} end)
+    counters = data["counters"] || %{}
 
     %{instances: instances, counters: counters}
+  end
+
+  defp deserialize_instance(name, inst) do
+    %{
+      name: inst["name"] || name,
+      type: String.to_existing_atom(inst["type"] || "basic"),
+      created_at: inst["created_at"],
+      bind: inst["bind"] || "127.0.0.1",
+      ports: inst["ports"] || [],
+      pids: inst["pids"] || [],
+      password: inst["password"],
+      url: inst["url"] || "",
+      metadata: atomize_keys(inst["metadata"] || %{})
+    }
   end
 
   defp atomize_keys(map) when is_map(map) do
@@ -583,6 +564,13 @@ defmodule RedisServerWrapper.Manager do
       end
     end)
     |> Enum.uniq()
+  end
+
+  defp read_node_pidfile(port) do
+    pidfile =
+      Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{port}", "redis.pid"])
+
+    read_pidfile(pidfile)
   end
 
   defp read_pidfile(path) do

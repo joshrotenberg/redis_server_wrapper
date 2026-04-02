@@ -31,7 +31,7 @@ defmodule RedisServerWrapper do
     * **Arbitrary config** - pass any Redis directive via `:extra` option
   """
 
-  alias RedisServerWrapper.{Server, Cluster, Sentinel}
+  alias RedisServerWrapper.{Cluster, Sentinel, Server}
 
   @doc """
   Starts a single redis-server instance. See `RedisServerWrapper.Server` for options.
@@ -64,21 +64,15 @@ defmodule RedisServerWrapper do
   """
   @spec version(String.t()) :: {:ok, String.t()} | {:error, term()}
   def version(bin \\ "redis-server") do
-    case System.find_executable(bin) do
-      nil ->
-        {:error, {:binary_not_found, bin}}
-
-      path ->
-        case System.cmd(path, ["--version"], stderr_to_stdout: true) do
-          {output, 0} ->
-            case Regex.run(~r/v=(\S+)/, output) do
-              [_, version] -> {:ok, version}
-              _ -> {:ok, String.trim(output)}
-            end
-
-          {output, _} ->
-            {:error, output}
-        end
+    with path when not is_nil(path) <- System.find_executable(bin),
+         {output, 0} <- System.cmd(path, ["--version"], stderr_to_stdout: true) do
+      case Regex.run(~r/v=(\S+)/, output) do
+        [_, version] -> {:ok, version}
+        _ -> {:ok, String.trim(output)}
+      end
+    else
+      nil -> {:error, {:binary_not_found, bin}}
+      {output, _} -> {:error, output}
     end
   end
 end
