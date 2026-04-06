@@ -16,7 +16,8 @@ defmodule RedisServerWrapper.MixProject do
       package: package(),
       docs: docs(),
       source_url: @source_url,
-      homepage_url: @source_url
+      homepage_url: @source_url,
+      dialyzer: [plt_file: {:no_warn, "_build/dev/dialyxir_#{System.otp_release()}.plt"}]
     ]
   end
 
@@ -30,7 +31,8 @@ defmodule RedisServerWrapper.MixProject do
   defp deps do
     [
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
