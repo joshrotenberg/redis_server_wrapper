@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.3.0...v0.4.0) (2026-04-06)
+
+
+### Features
+
+* add managed option for Port-based process lifecycle ([#12](https://github.com/joshrotenberg/redis_server_wrapper/issues/12)) ([6be3284](https://github.com/joshrotenberg/redis_server_wrapper/commit/6be32846bd434c65b92dcd20049f93402ec9264e))
+
 ## [0.3.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.2.0...v0.3.0) (2026-04-02)
 
 
