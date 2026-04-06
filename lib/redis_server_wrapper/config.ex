@@ -61,7 +61,7 @@ defmodule RedisServerWrapper.Config do
             password: nil,
             loglevel: :notice,
             logfile: nil,
-            daemonize: true,
+            daemonize: false,
             pidfile: nil,
             dir: nil,
             save: :default,
