@@ -20,6 +20,9 @@ defmodule RedisServerWrapper.Server do
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
     * `:name` - GenServer name registration
     * `:timeout` - startup timeout in ms (default: 10_000)
+    * `:managed` - when `true` (default), redis-server runs as a Port tied to the
+      BEAM lifecycle. When the BEAM exits, the port closes and redis-server receives
+      SIGHUP. When `false`, redis-server daemonizes independently (legacy behavior).
   """
 
   use GenServer
@@ -36,6 +39,8 @@ defmodule RedisServerWrapper.Server do
     :pid,
     :node_dir,
     :redis_server_bin,
+    :port_ref,
+    managed: true,
     detached: false
   ]
 
@@ -45,6 +50,8 @@ defmodule RedisServerWrapper.Server do
           pid: non_neg_integer() | nil,
           node_dir: String.t() | nil,
           redis_server_bin: String.t(),
+          port_ref: port() | nil,
+          managed: boolean(),
           detached: boolean()
         }
 
@@ -91,10 +98,10 @@ defmodule RedisServerWrapper.Server do
   def cli(server), do: GenServer.call(server, :cli)
 
   @doc """
-  Detaches the server — the redis-server OS process will NOT be stopped
-  when this GenServer terminates.
+  Detaches the server -- the redis-server OS process will NOT be stopped
+  when this GenServer terminates. Returns `{:error, :managed_server}` in managed mode.
   """
-  @spec detach(GenServer.server()) :: :ok
+  @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
   @doc "Gracefully stops the GenServer (which stops redis-server unless detached)."
@@ -112,16 +119,17 @@ defmodule RedisServerWrapper.Server do
     redis_server_bin = Keyword.get(opts, :redis_server_bin, "redis-server")
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, @default_timeout)
+    managed = Keyword.get(opts, :managed, true)
 
     # Validate binaries exist
     with :ok <- check_binary(redis_server_bin),
          :ok <- check_binary(redis_cli_bin) do
       config_opts =
-        Keyword.drop(opts, [:redis_server_bin, :redis_cli_bin, :name, :timeout])
+        Keyword.drop(opts, [:redis_server_bin, :redis_cli_bin, :name, :timeout, :managed])
 
       config = Config.new(config_opts)
 
-      case start_redis_server(config, redis_server_bin, redis_cli_bin, timeout) do
+      case start_redis_server(config, redis_server_bin, redis_cli_bin, timeout, managed) do
         {:ok, state} ->
           {:ok, state}
 
@@ -153,7 +161,8 @@ defmodule RedisServerWrapper.Server do
       password: state.config.password,
       pid: state.pid,
       node_dir: state.node_dir,
-      detached: state.detached
+      detached: state.detached,
+      managed: state.managed
     }
 
     {:reply, info, state}
@@ -163,6 +172,15 @@ defmodule RedisServerWrapper.Server do
     {:reply, state.cli, state}
   end
 
+  def handle_call(:detach, _from, %{managed: true} = state) do
+    Logger.warning(
+      "Detaching a managed (Port-based) server is not supported; " <>
+        "the OS process is tied to the BEAM lifecycle. Use managed: false to enable detach."
+    )
+
+    {:reply, {:error, :managed_server}, state}
+  end
+
   def handle_call(:detach, _from, state) do
     {:reply, :ok, %{state | detached: true}}
   end
@@ -170,6 +188,18 @@ defmodule RedisServerWrapper.Server do
   @impl true
   def handle_info({:EXIT, _port, _reason}, state) do
     # Ignore port exits from System.cmd calls (trap_exit catches these)
+    {:noreply, state}
+  end
+
+  def handle_info({port_ref, {:exit_status, status}}, %{port_ref: port_ref} = state)
+      when is_port(port_ref) do
+    Logger.info("Managed redis-server exited with status #{status}")
+    {:noreply, %{state | port_ref: nil, pid: nil}}
+  end
+
+  def handle_info({port_ref, {:data, {:eol, line}}}, %{port_ref: port_ref} = state)
+      when is_port(port_ref) do
+    Logger.debug("redis-server: #{line}")
     {:noreply, state}
   end
 
@@ -188,6 +218,11 @@ defmodule RedisServerWrapper.Server do
     # Give it a moment to shut down
     Process.sleep(500)
 
+    # Close the port if managed
+    if state.port_ref && Port.info(state.port_ref) != nil do
+      Port.close(state.port_ref)
+    end
+
     # Force kill if still alive
     if state.pid && pid_alive?(state.pid) do
       Logger.warning("redis-server PID #{state.pid} still alive after SHUTDOWN, sending SIGKILL")
@@ -201,26 +236,97 @@ defmodule RedisServerWrapper.Server do
   # Internal helpers
   # -------------------------------------------------------------------
 
-  defp start_redis_server(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_redis_server(config, redis_server_bin, redis_cli_bin, timeout, managed) do
+    if managed do
+      start_managed(config, redis_server_bin, redis_cli_bin, timeout)
+    else
+      start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
+    end
+  end
+
+  # Port-based: redis-server runs in the foreground, tied to the BEAM.
+  defp start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
     node_dir = make_node_dir(config.port)
 
-    # Inject daemonize + pidfile + dir into config
     config = %{
       config
-      | daemonize: true,
+      | daemonize: false,
         pidfile: Path.join(node_dir, "redis.pid"),
         dir: node_dir,
         logfile: config.logfile || Path.join(node_dir, "redis.log")
     }
 
-    # Write redis.conf
     conf_path = Path.join(node_dir, "redis.conf")
     File.write!(conf_path, Config.to_config_string(config))
 
-    # Start redis-server
+    server_bin_path = System.find_executable(redis_server_bin)
+
+    port_ref =
+      Port.open({:spawn_executable, server_bin_path}, [
+        {:args, [conf_path]},
+        :binary,
+        :exit_status,
+        {:line, 1024}
+      ])
+
+    cli =
+      Cli.new(
+        bin: redis_cli_bin,
+        host: config.bind,
+        port: config.port,
+        password: config.password
+      )
+
+    case Cli.wait_for_ready(cli, timeout) do
+      :ok ->
+        os_pid =
+          case :erlang.port_info(port_ref, :os_pid) do
+            {:os_pid, p} -> p
+            _ -> read_pidfile(Path.join(node_dir, "redis.pid"))
+          end
+
+        state = %__MODULE__{
+          config: config,
+          cli: cli,
+          pid: os_pid,
+          node_dir: node_dir,
+          redis_server_bin: redis_server_bin,
+          port_ref: port_ref,
+          managed: true
+        }
+
+        {:ok, state}
+
+      {:error, :timeout} ->
+        Port.close(port_ref)
+        {:error, {:server_start_timeout, config.port}}
+    end
+  end
+
+  # Daemonized: redis-server forks into background, independent of the BEAM.
+  defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
+    # Check for stale process from a previous run before wiping the node dir
+    stale_pidfile =
+      Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
+
+    kill_stale_process(stale_pidfile)
+
+    node_dir = make_node_dir(config.port)
+    pidfile_path = Path.join(node_dir, "redis.pid")
+
+    config = %{
+      config
+      | daemonize: true,
+        pidfile: pidfile_path,
+        dir: node_dir,
+        logfile: config.logfile || Path.join(node_dir, "redis.log")
+    }
+
+    conf_path = Path.join(node_dir, "redis.conf")
+    File.write!(conf_path, Config.to_config_string(config))
+
     case System.cmd(redis_server_bin, [conf_path], stderr_to_stdout: true) do
       {_output, 0} ->
-        # Read PID from pidfile
         cli =
           Cli.new(
             bin: redis_cli_bin,
@@ -231,14 +337,15 @@ defmodule RedisServerWrapper.Server do
 
         case Cli.wait_for_ready(cli, timeout) do
           :ok ->
-            pid = read_pidfile(Path.join(node_dir, "redis.pid"))
+            pid = read_pidfile(pidfile_path)
 
             state = %__MODULE__{
               config: config,
               cli: cli,
               pid: pid,
               node_dir: node_dir,
-              redis_server_bin: redis_server_bin
+              redis_server_bin: redis_server_bin,
+              managed: false
             }
 
             {:ok, state}
@@ -249,6 +356,30 @@ defmodule RedisServerWrapper.Server do
 
       {output, code} ->
         {:error, {:server_start_failed, config.port, code, output}}
+    end
+  end
+
+  defp kill_stale_process(pidfile_path) do
+    pidfile_path
+    |> read_pidfile()
+    |> maybe_kill_stale()
+  end
+
+  defp maybe_kill_stale(nil), do: :ok
+
+  defp maybe_kill_stale(stale_pid) do
+    if pid_alive?(stale_pid) do
+      Logger.warning("Killing stale redis-server process #{stale_pid}")
+      System.cmd("kill", [to_string(stale_pid)], stderr_to_stdout: true)
+      Process.sleep(500)
+      force_kill_if_alive(stale_pid)
+    end
+  end
+
+  defp force_kill_if_alive(pid) do
+    if pid_alive?(pid) do
+      Logger.warning("Stale PID #{pid} still alive, sending SIGKILL")
+      System.cmd("kill", ["-9", to_string(pid)], stderr_to_stdout: true)
     end
   end
 

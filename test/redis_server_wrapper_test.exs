@@ -28,7 +28,7 @@ defmodule RedisServerWrapperTest do
       assert output =~ "port 6400"
       assert output =~ "bind 127.0.0.1"
       assert output =~ "requirepass secret"
-      assert output =~ "daemonize yes"
+      assert output =~ "daemonize no"
       assert output =~ "appendonly no"
     end
 
@@ -143,12 +143,12 @@ defmodule RedisServerWrapperTest do
       Process.sleep(500)
     end
 
-    test "detach prevents shutdown on stop" do
-      {:ok, server} = Server.start_link(port: 6402)
+    test "detach prevents shutdown on stop (unmanaged)" do
+      {:ok, server} = Server.start_link(port: 6402, managed: false)
       info = Server.info(server)
       os_pid = info.pid
 
-      Server.detach(server)
+      assert :ok = Server.detach(server)
       Server.stop(server)
 
       # The OS process should still be alive
@@ -162,12 +162,74 @@ defmodule RedisServerWrapperTest do
       Process.sleep(500)
     end
 
+    test "detach returns error in managed mode" do
+      {:ok, server} = Server.start_link(port: 6404)
+
+      assert {:error, :managed_server} = Server.detach(server)
+
+      Server.stop(server)
+      Process.sleep(500)
+    end
+
     test "cli returns usable Cli struct" do
       {:ok, server} = Server.start_link(port: 6403)
 
       cli = Server.cli(server)
       assert %Cli{} = cli
       assert Cli.ping(cli)
+
+      Server.stop(server)
+      Process.sleep(500)
+    end
+  end
+
+  describe "Server managed mode" do
+    test "managed server dies when GenServer stops" do
+      {:ok, server} = Server.start_link(port: 6410, managed: true)
+      assert Server.ping(server)
+
+      info = Server.info(server)
+      assert info.managed == true
+      os_pid = info.pid
+      assert os_pid != nil
+
+      Server.stop(server)
+      Process.sleep(1000)
+
+      # The OS process should be gone
+      {_, code} = System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true)
+      assert code != 0
+    end
+
+    test "managed server runs commands" do
+      {:ok, server} = Server.start_link(port: 6411)
+
+      assert {:ok, "OK"} = Server.run(server, ["SET", "managed_key", "managed_val"])
+      assert {:ok, "managed_val"} = Server.run(server, ["GET", "managed_key"])
+
+      Server.stop(server)
+      Process.sleep(500)
+    end
+  end
+
+  describe "Server unmanaged mode" do
+    test "unmanaged server uses daemonize" do
+      {:ok, server} = Server.start_link(port: 6412, managed: false)
+      assert Server.ping(server)
+
+      info = Server.info(server)
+      assert info.managed == false
+      assert info.pid != nil
+
+      Server.stop(server)
+      Process.sleep(1000)
+    end
+
+    test "unmanaged server runs commands" do
+      {:ok, server} = Server.start_link(port: 6413, managed: false)
+
+      assert {:ok, "OK"} = Server.run(server, ["SET", "unmanaged_key", "val"])
+      assert {:ok, "val"} = Server.run(server, ["GET", "unmanaged_key"])
 
       Server.stop(server)
       Process.sleep(500)
