@@ -246,6 +246,12 @@ defmodule RedisServerWrapper.Server do
 
   # Port-based: redis-server runs in the foreground, tied to the BEAM.
   defp start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
+    # Check for stale process from a previous (possibly daemonized) run
+    stale_pidfile =
+      Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
+
+    kill_stale_process(stale_pidfile)
+
     node_dir = make_node_dir(config.port)
 
     config = %{
@@ -298,7 +304,7 @@ defmodule RedisServerWrapper.Server do
         {:ok, state}
 
       {:error, :timeout} ->
-        Port.close(port_ref)
+        safe_port_close(port_ref)
         {:error, {:server_start_timeout, config.port}}
     end
   end
@@ -413,6 +419,14 @@ defmodule RedisServerWrapper.Server do
       {_, 0} -> true
       _ -> false
     end
+  end
+
+  defp safe_port_close(port_ref) do
+    if :erlang.port_info(port_ref) != :undefined do
+      Port.close(port_ref)
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp check_binary(bin) do
