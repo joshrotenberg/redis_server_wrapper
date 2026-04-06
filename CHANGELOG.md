@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.4.0...v0.4.1) (2026-04-06)
+
+
+### Bug Fixes
+
+* add stale process cleanup to managed mode and guard Port.close ([#14](https://github.com/joshrotenberg/redis_server_wrapper/issues/14)) ([5cf69ac](https://github.com/joshrotenberg/redis_server_wrapper/commit/5cf69ac6f77fcb1b4ad5b6cd580032a7b398e98e))
+
 ## [0.4.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.3.0...v0.4.0) (2026-04-06)
 
 
