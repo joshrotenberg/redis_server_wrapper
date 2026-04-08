@@ -108,6 +108,48 @@ defmodule RedisServerWrapper.Server do
   @spec stop(GenServer.server()) :: :ok
   def stop(server), do: GenServer.stop(server, :normal)
 
+  @doc """
+  Returns the default redis-server binary path.
+  Prefers `redis-stack-server` if available (includes JSON, Search, etc.),
+  falls back to `redis-server`.
+  """
+  @spec default_server_bin() :: String.t()
+  @doc """
+  Returns the default redis-server binary path.
+  Prefers the actual redis-server binary from redis-stack (includes modules)
+  over the wrapper script, then falls back to plain redis-server.
+
+  We avoid the redis-stack-server bash wrapper because it overrides our
+  `dir` config with its own --dir flag, causing cluster config files to
+  end up in the wrong place. Instead, we use the real binary directly.
+  """
+  @spec default_server_bin() :: String.t()
+  def default_server_bin do
+    # Prefer the actual binary inside the redis-stack cask (not the wrapper script)
+    stack_bin = find_stack_redis_server()
+
+    cond do
+      stack_bin -> stack_bin
+      System.find_executable("redis-server") -> "redis-server"
+      true -> "redis-server"
+    end
+  end
+
+  # Find the real redis-server binary inside the redis-stack installation.
+  # The wrapper script at /opt/homebrew/bin/redis-stack-server just calls
+  # the real binary with --loadmodule flags. We want the real binary so
+  # we have full control over config (especially `dir`).
+  defp find_stack_redis_server do
+    paths = [
+      "/opt/homebrew/Caskroom/redis-stack-server/*/bin/redis-server",
+      "/usr/local/Caskroom/redis-stack-server/*/bin/redis-server"
+    ]
+
+    paths
+    |> Enum.flat_map(&Path.wildcard/1)
+    |> List.first()
+  end
+
   # -------------------------------------------------------------------
   # GenServer callbacks
   # -------------------------------------------------------------------
@@ -116,7 +158,7 @@ defmodule RedisServerWrapper.Server do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    redis_server_bin = Keyword.get(opts, :redis_server_bin, "redis-server")
+    redis_server_bin = Keyword.get_lazy(opts, :redis_server_bin, &default_server_bin/0)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     managed = Keyword.get(opts, :managed, true)
@@ -223,11 +265,19 @@ defmodule RedisServerWrapper.Server do
       Port.close(state.port_ref)
     end
 
-    # Force kill if still alive
+    # Force kill if still alive.
+    # Use kill on the process group (-pid) to also catch child processes.
+    # This handles redis-stack-server (bash wrapper) which spawns a child redis-server.
     if state.pid && pid_alive?(state.pid) do
       Logger.warning("redis-server PID #{state.pid} still alive after SHUTDOWN, sending SIGKILL")
+      # Kill the process group (negative PID) to get wrapper + child
+      System.cmd("kill", ["-9", "-#{state.pid}"], stderr_to_stdout: true)
+      # Also try the individual PID in case process group kill didn't work
       System.cmd("kill", ["-9", to_string(state.pid)], stderr_to_stdout: true)
     end
+
+    # Extra safety: find and kill any redis-server on our port
+    kill_by_port(state.config.port)
 
     :ok
   end
@@ -267,9 +317,12 @@ defmodule RedisServerWrapper.Server do
 
     server_bin_path = System.find_executable(redis_server_bin)
 
+    # If using the redis-stack binary, load the Stack modules
+    module_args = detect_stack_modules(server_bin_path)
+
     port_ref =
       Port.open({:spawn_executable, server_bin_path}, [
-        {:args, [conf_path]},
+        {:args, [conf_path | module_args]},
         :binary,
         :exit_status,
         {:line, 1024}
@@ -427,6 +480,59 @@ defmodule RedisServerWrapper.Server do
     end
   rescue
     ArgumentError -> :ok
+  end
+
+  # Kill any redis-server process listening on a specific port.
+  # This handles orphaned processes from wrapper scripts (redis-stack-server).
+  defp kill_by_port(port) when is_integer(port) do
+    case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.each(fn pid_str ->
+          System.cmd("kill", ["-9", String.trim(pid_str)], stderr_to_stdout: true)
+        end)
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp kill_by_port(_), do: :ok
+
+  # Detect Redis Stack modules (RedisJSON, RediSearch, etc.) if we're using
+  # the redis-stack binary. Returns command-line args like
+  # ["--loadmodule", "/path/to/rejson.so", "--loadmodule", "/path/to/redisearch.so", ...]
+  defp detect_stack_modules(server_bin_path) do
+    # Check if this binary lives inside a redis-stack installation
+    bin_dir = Path.dirname(server_bin_path)
+    lib_dir = Path.join(Path.dirname(bin_dir), "lib")
+
+    if File.dir?(lib_dir) do
+      # Load modules in a sensible order
+      modules = [
+        {"rediscompat.so", []},
+        {"redisearch.so", ["MAXSEARCHRESULTS", "10000", "MAXAGGREGATERESULTS", "10000"]},
+        {"redistimeseries.so", []},
+        {"rejson.so", []},
+        {"redisbloom.so", []}
+      ]
+
+      modules
+      |> Enum.flat_map(fn {mod_file, args} ->
+        mod_path = Path.join(lib_dir, mod_file)
+
+        if File.exists?(mod_path) do
+          ["--loadmodule", mod_path | args]
+        else
+          []
+        end
+      end)
+    else
+      []
+    end
   end
 
   defp check_binary(bin) do

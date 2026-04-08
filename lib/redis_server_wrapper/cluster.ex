@@ -113,7 +113,7 @@ defmodule RedisServerWrapper.Cluster do
     base_port = Keyword.get(opts, :base_port, 7000)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     password = Keyword.get(opts, :password)
-    redis_server_bin = Keyword.get(opts, :redis_server_bin, "redis-server")
+    redis_server_bin = Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
@@ -297,6 +297,9 @@ defmodule RedisServerWrapper.Cluster do
             save: :disabled
           ] ++ extra_to_opts(extra)
 
+        # Clean any stale cluster config from previous runs
+        clean_node_dir(port)
+
         case Server.start_link(opts) do
           {:ok, pid} ->
             {:cont, {:ok, acc ++ [pid]}}
@@ -313,8 +316,18 @@ defmodule RedisServerWrapper.Cluster do
 
   defp cleanup_ports(ports, bind, redis_cli_bin, password) do
     Enum.each(ports, fn port ->
+      # Try graceful shutdown first
       cli = Cli.new(bin: redis_cli_bin, host: bind, port: port, password: password)
       Cli.shutdown(cli)
+
+      # Force kill anything still on this port
+      case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
+        {output, 0} ->
+          output
+          |> String.split("\n", trim: true)
+          |> Enum.each(&System.cmd("kill", ["-9", String.trim(&1)], stderr_to_stdout: true))
+        _ -> :ok
+      end
     end)
   end
 
@@ -329,6 +342,33 @@ defmodule RedisServerWrapper.Cluster do
 
   defp extra_to_opts([]), do: []
   defp extra_to_opts(extra), do: [extra: extra]
+
+  # Remove stale cluster config files from a node's data directory.
+  # These persist across runs and cause "Node is not empty" errors
+  # when trying to create a new cluster.
+  defp clean_node_dir(port) do
+    # Clean our temp dir
+    base = System.tmp_dir!()
+    node_dir = Path.join([base, "redis-server-wrapper", "node-#{port}"])
+    clean_cluster_files(node_dir, port)
+
+    # Also clean redis-stack-server's default data dir.
+    # redis-stack-server writes cluster config to its own dir regardless of
+    # what `dir` is set to in our config.
+    stack_dir = "/opt/homebrew/var/db/redis-stack"
+    clean_cluster_files(stack_dir, port)
+  end
+
+  defp clean_cluster_files(dir, port) do
+    if File.dir?(dir) do
+      for pattern <- ["nodes-#{port}.conf", "nodes-*.conf", "dump.rdb", "appendonly.aof", "appendonlydir"] do
+        Path.wildcard(Path.join(dir, pattern))
+        |> Enum.each(fn path ->
+          if File.dir?(path), do: File.rm_rf!(path), else: File.rm(path)
+        end)
+      end
+    end
+  end
 
   defp extract_gen_opts(opts) do
     case Keyword.pop(opts, :name) do
