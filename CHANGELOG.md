@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.4.1...v0.5.0) (2026-04-08)
+
+
+### Features
+
+* add redis-stack-server support with auto module detection ([#17](https://github.com/joshrotenberg/redis_server_wrapper/issues/17)) ([e48a0d3](https://github.com/joshrotenberg/redis_server_wrapper/commit/e48a0d32e8a702c99c40e6162ec0dea05e27d107))
+
 ## [0.4.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.4.0...v0.4.1) (2026-04-06)
 
 
