@@ -113,7 +113,10 @@ defmodule RedisServerWrapper.Cluster do
     base_port = Keyword.get(opts, :base_port, 7000)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     password = Keyword.get(opts, :password)
-    redis_server_bin = Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
+
+    redis_server_bin =
+      Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
+
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
@@ -326,7 +329,9 @@ defmodule RedisServerWrapper.Cluster do
           output
           |> String.split("\n", trim: true)
           |> Enum.each(&System.cmd("kill", ["-9", String.trim(&1)], stderr_to_stdout: true))
-        _ -> :ok
+
+        _ ->
+          :ok
       end
     end)
   end
@@ -361,7 +366,13 @@ defmodule RedisServerWrapper.Cluster do
 
   defp clean_cluster_files(dir, port) do
     if File.dir?(dir) do
-      for pattern <- ["nodes-#{port}.conf", "nodes-*.conf", "dump.rdb", "appendonly.aof", "appendonlydir"] do
+      for pattern <- [
+            "nodes-#{port}.conf",
+            "nodes-*.conf",
+            "dump.rdb",
+            "appendonly.aof",
+            "appendonlydir"
+          ] do
         Path.wildcard(Path.join(dir, pattern))
         |> Enum.each(fn path ->
           if File.dir?(path), do: File.rm_rf!(path), else: File.rm(path)
