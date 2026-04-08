@@ -37,12 +37,18 @@ jobs:
       - name: Restore deps cache
         uses: actions/cache@v5
         with:
+          path: deps
+          key: deps-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+
+      - name: Restore build cache
+        uses: actions/cache@v5
+        with:
           path: |
-            deps
-            _build
-          key: mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+            _build/dev/lib
+            _build/test/lib
+          key: build-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}-${{ hashFiles('lib/**/*.ex') }}
           restore-keys: |
-            mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+            build-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}-
 
       - name: Install dependencies
         run: mix deps.get
@@ -55,6 +61,12 @@ jobs:
 
       - name: Credo
         run: mix credo --strict
+
+      - name: Restore PLT cache
+        uses: actions/cache@v5
+        with:
+          path: _build/dev/*.plt
+          key: plt-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
 
       - name: Dialyzer
         run: mix dialyzer

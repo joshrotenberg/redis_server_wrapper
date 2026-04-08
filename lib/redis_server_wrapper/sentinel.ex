@@ -117,7 +117,10 @@ defmodule RedisServerWrapper.Sentinel do
     failover_timeout_ms = Keyword.get(opts, :failover_timeout_ms, 10_000)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     password = Keyword.get(opts, :password)
-    redis_server_bin = Keyword.get(opts, :redis_server_bin, "redis-server")
+
+    redis_server_bin =
+      Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
+
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
 
