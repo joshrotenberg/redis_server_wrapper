@@ -108,11 +108,6 @@ defmodule RedisServerWrapper.Server do
   @spec stop(GenServer.server()) :: :ok
   def stop(server), do: GenServer.stop(server, :normal)
 
-  @doc """
-  Returns the default redis-server binary path.
-  Prefers `redis-stack-server` if available (includes JSON, Search, etc.),
-  falls back to `redis-server`.
-  """
   @spec default_server_bin() :: String.t()
   @doc """
   Returns the default redis-server binary path.
