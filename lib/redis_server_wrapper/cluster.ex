@@ -366,19 +366,14 @@ defmodule RedisServerWrapper.Cluster do
 
   defp clean_cluster_files(dir, port) do
     if File.dir?(dir) do
-      for pattern <- [
-            "nodes-#{port}.conf",
-            "nodes-*.conf",
-            "dump.rdb",
-            "appendonly.aof",
-            "appendonlydir"
-          ] do
-        Path.wildcard(Path.join(dir, pattern))
-        |> Enum.each(fn path ->
-          if File.dir?(path), do: File.rm_rf!(path), else: File.rm(path)
-        end)
-      end
+      ["nodes-#{port}.conf", "nodes-*.conf", "dump.rdb", "appendonly.aof", "appendonlydir"]
+      |> Enum.flat_map(&Path.wildcard(Path.join(dir, &1)))
+      |> Enum.each(&remove_path/1)
     end
+  end
+
+  defp remove_path(path) do
+    if File.dir?(path), do: File.rm_rf!(path), else: File.rm(path)
   end
 
   defp extract_gen_opts(opts) do

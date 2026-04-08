@@ -516,18 +516,15 @@ defmodule RedisServerWrapper.Server do
       ]
 
       modules
-      |> Enum.flat_map(fn {mod_file, args} ->
-        mod_path = Path.join(lib_dir, mod_file)
-
-        if File.exists?(mod_path) do
-          ["--loadmodule", mod_path | args]
-        else
-          []
-        end
-      end)
+      |> Enum.flat_map(&module_args(lib_dir, &1))
     else
       []
     end
+  end
+
+  defp module_args(lib_dir, {mod_file, args}) do
+    mod_path = Path.join(lib_dir, mod_file)
+    if File.exists?(mod_path), do: ["--loadmodule", mod_path | args], else: []
   end
 
   defp check_binary(bin) do
