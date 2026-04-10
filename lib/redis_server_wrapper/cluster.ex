@@ -29,6 +29,10 @@ defmodule RedisServerWrapper.Cluster do
     * `:timeout` - startup timeout per node in ms (default: 10_000)
     * `:cluster_node_timeout` - cluster node timeout in ms (default: 5000)
     * `:extra` - extra redis config directives as `[{key, value}]`
+    * `:managed` - when `true` (default), each node runs as a Port tied
+      to the BEAM lifecycle. When `false`, nodes daemonize independently
+      and survive BEAM exits; combine with `detach/1` so this GenServer
+      will not tear them down on terminate either.
   """
 
   use GenServer
@@ -121,6 +125,7 @@ defmodule RedisServerWrapper.Cluster do
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
     extra = Keyword.get(opts, :extra, [])
+    managed = Keyword.get(opts, :managed, true)
 
     total_nodes = masters * (1 + replicas)
     ports = Enum.map(0..(total_nodes - 1), &(base_port + &1))
@@ -129,17 +134,19 @@ defmodule RedisServerWrapper.Cluster do
     cleanup_ports(ports, bind, redis_cli_bin, password)
     Process.sleep(500)
 
+    node_opts = %{
+      bind: bind,
+      password: password,
+      redis_server_bin: redis_server_bin,
+      redis_cli_bin: redis_cli_bin,
+      timeout: timeout,
+      cluster_node_timeout: cluster_node_timeout,
+      extra: extra,
+      managed: managed
+    }
+
     # Start each node as a Server GenServer
-    case start_nodes(
-           ports,
-           bind,
-           password,
-           redis_server_bin,
-           redis_cli_bin,
-           timeout,
-           cluster_node_timeout,
-           extra
-         ) do
+    case start_nodes(ports, node_opts) do
       {:ok, node_pids} ->
         # Form the cluster
         seed_cli = Cli.new(bin: redis_cli_bin, host: bind, port: base_port, password: password)
@@ -274,31 +281,23 @@ defmodule RedisServerWrapper.Cluster do
   # Internal
   # -------------------------------------------------------------------
 
-  defp start_nodes(
-         ports,
-         bind,
-         password,
-         redis_server_bin,
-         redis_cli_bin,
-         timeout,
-         cluster_node_timeout,
-         extra
-       ) do
+  defp start_nodes(ports, node_opts) do
     results =
       Enum.reduce_while(ports, {:ok, []}, fn port, {:ok, acc} ->
         opts =
           [
             port: port,
-            bind: bind,
-            password: password,
-            redis_server_bin: redis_server_bin,
-            redis_cli_bin: redis_cli_bin,
-            timeout: timeout,
+            bind: node_opts.bind,
+            password: node_opts.password,
+            redis_server_bin: node_opts.redis_server_bin,
+            redis_cli_bin: node_opts.redis_cli_bin,
+            timeout: node_opts.timeout,
+            managed: node_opts.managed,
             cluster_enabled: true,
             cluster_config_file: "nodes-#{port}.conf",
-            cluster_node_timeout: cluster_node_timeout,
+            cluster_node_timeout: node_opts.cluster_node_timeout,
             save: :disabled
-          ] ++ extra_to_opts(extra)
+          ] ++ extra_to_opts(node_opts.extra)
 
         # Clean any stale cluster config from previous runs
         clean_node_dir(port)
