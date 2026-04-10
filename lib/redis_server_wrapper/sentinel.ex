@@ -139,28 +139,18 @@ defmodule RedisServerWrapper.Sentinel do
     cleanup_ports(all_ports, bind, redis_cli_bin, password)
     Process.sleep(500)
 
-    with {:ok, master_pid} <-
-           start_master(
-             master_port,
-             bind,
-             password,
-             redis_server_bin,
-             redis_cli_bin,
-             timeout,
-             managed
-           ),
+    node_opts = %{
+      bind: bind,
+      password: password,
+      redis_server_bin: redis_server_bin,
+      redis_cli_bin: redis_cli_bin,
+      timeout: timeout,
+      managed: managed
+    }
+
+    with {:ok, master_pid} <- start_master(master_port, node_opts),
          {:ok, replica_pids} <-
-           start_replicas(
-             num_replicas,
-             replica_base_port,
-             master_port,
-             bind,
-             password,
-             redis_server_bin,
-             redis_cli_bin,
-             timeout,
-             managed
-           ),
+           start_replicas(num_replicas, replica_base_port, master_port, node_opts),
          # Let replication link up
          _ <- Process.sleep(1000),
          {:ok, sentinel_os_pids, sentinel_dir} <-
@@ -328,47 +318,36 @@ defmodule RedisServerWrapper.Sentinel do
   # Internal
   # -------------------------------------------------------------------
 
-  defp start_master(port, bind, password, redis_server_bin, redis_cli_bin, timeout, managed) do
+  defp start_master(port, node_opts) do
     Server.start_link(
       port: port,
-      bind: bind,
-      password: password,
-      redis_server_bin: redis_server_bin,
-      redis_cli_bin: redis_cli_bin,
-      timeout: timeout,
-      managed: managed,
+      bind: node_opts.bind,
+      password: node_opts.password,
+      redis_server_bin: node_opts.redis_server_bin,
+      redis_cli_bin: node_opts.redis_cli_bin,
+      timeout: node_opts.timeout,
+      managed: node_opts.managed,
       save: :disabled
     )
   end
 
-  defp start_replicas(0, _base_port, _master_port, _bind, _pw, _rsb, _rcb, _timeout, _managed),
-    do: {:ok, []}
+  defp start_replicas(0, _base_port, _master_port, _node_opts), do: {:ok, []}
 
-  defp start_replicas(
-         count,
-         base_port,
-         master_port,
-         bind,
-         password,
-         redis_server_bin,
-         redis_cli_bin,
-         timeout,
-         managed
-       ) do
+  defp start_replicas(count, base_port, master_port, node_opts) do
     results =
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
         port = base_port + i
 
         opts = [
           port: port,
-          bind: bind,
-          password: password,
-          masterauth: password,
-          replicaof: {bind, master_port},
-          redis_server_bin: redis_server_bin,
-          redis_cli_bin: redis_cli_bin,
-          timeout: timeout,
-          managed: managed,
+          bind: node_opts.bind,
+          password: node_opts.password,
+          masterauth: node_opts.password,
+          replicaof: {node_opts.bind, master_port},
+          redis_server_bin: node_opts.redis_server_bin,
+          redis_cli_bin: node_opts.redis_cli_bin,
+          timeout: node_opts.timeout,
+          managed: node_opts.managed,
           save: :disabled
         ]
 
