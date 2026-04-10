@@ -30,6 +30,11 @@ defmodule RedisServerWrapper.Sentinel do
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
     * `:timeout` - startup timeout per node in ms (default: 10_000)
+    * `:managed` - when `true` (default), master and replicas run as
+      Ports tied to the BEAM lifecycle. When `false`, they daemonize
+      independently and survive BEAM exits; combine with `detach/1`
+      so this GenServer will not tear them down on terminate either.
+      Sentinel processes always daemonize regardless of this flag.
   """
 
   use GenServer
@@ -123,6 +128,7 @@ defmodule RedisServerWrapper.Sentinel do
 
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
+    managed = Keyword.get(opts, :managed, true)
 
     all_ports =
       [master_port] ++
@@ -134,7 +140,15 @@ defmodule RedisServerWrapper.Sentinel do
     Process.sleep(500)
 
     with {:ok, master_pid} <-
-           start_master(master_port, bind, password, redis_server_bin, redis_cli_bin, timeout),
+           start_master(
+             master_port,
+             bind,
+             password,
+             redis_server_bin,
+             redis_cli_bin,
+             timeout,
+             managed
+           ),
          {:ok, replica_pids} <-
            start_replicas(
              num_replicas,
@@ -144,7 +158,8 @@ defmodule RedisServerWrapper.Sentinel do
              password,
              redis_server_bin,
              redis_cli_bin,
-             timeout
+             timeout,
+             managed
            ),
          # Let replication link up
          _ <- Process.sleep(1000),
@@ -313,7 +328,7 @@ defmodule RedisServerWrapper.Sentinel do
   # Internal
   # -------------------------------------------------------------------
 
-  defp start_master(port, bind, password, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_master(port, bind, password, redis_server_bin, redis_cli_bin, timeout, managed) do
     Server.start_link(
       port: port,
       bind: bind,
@@ -321,11 +336,12 @@ defmodule RedisServerWrapper.Sentinel do
       redis_server_bin: redis_server_bin,
       redis_cli_bin: redis_cli_bin,
       timeout: timeout,
+      managed: managed,
       save: :disabled
     )
   end
 
-  defp start_replicas(0, _base_port, _master_port, _bind, _pw, _rsb, _rcb, _timeout),
+  defp start_replicas(0, _base_port, _master_port, _bind, _pw, _rsb, _rcb, _timeout, _managed),
     do: {:ok, []}
 
   defp start_replicas(
@@ -336,7 +352,8 @@ defmodule RedisServerWrapper.Sentinel do
          password,
          redis_server_bin,
          redis_cli_bin,
-         timeout
+         timeout,
+         managed
        ) do
     results =
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
@@ -351,6 +368,7 @@ defmodule RedisServerWrapper.Sentinel do
           redis_server_bin: redis_server_bin,
           redis_cli_bin: redis_cli_bin,
           timeout: timeout,
+          managed: managed,
           save: :disabled
         ]
 

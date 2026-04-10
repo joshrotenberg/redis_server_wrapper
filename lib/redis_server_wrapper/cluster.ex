@@ -29,6 +29,10 @@ defmodule RedisServerWrapper.Cluster do
     * `:timeout` - startup timeout per node in ms (default: 10_000)
     * `:cluster_node_timeout` - cluster node timeout in ms (default: 5000)
     * `:extra` - extra redis config directives as `[{key, value}]`
+    * `:managed` - when `true` (default), each node runs as a Port tied
+      to the BEAM lifecycle. When `false`, nodes daemonize independently
+      and survive BEAM exits; combine with `detach/1` so this GenServer
+      will not tear them down on terminate either.
   """
 
   use GenServer
@@ -121,6 +125,7 @@ defmodule RedisServerWrapper.Cluster do
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
     extra = Keyword.get(opts, :extra, [])
+    managed = Keyword.get(opts, :managed, true)
 
     total_nodes = masters * (1 + replicas)
     ports = Enum.map(0..(total_nodes - 1), &(base_port + &1))
@@ -138,7 +143,8 @@ defmodule RedisServerWrapper.Cluster do
            redis_cli_bin,
            timeout,
            cluster_node_timeout,
-           extra
+           extra,
+           managed
          ) do
       {:ok, node_pids} ->
         # Form the cluster
@@ -282,7 +288,8 @@ defmodule RedisServerWrapper.Cluster do
          redis_cli_bin,
          timeout,
          cluster_node_timeout,
-         extra
+         extra,
+         managed
        ) do
     results =
       Enum.reduce_while(ports, {:ok, []}, fn port, {:ok, acc} ->
@@ -294,6 +301,7 @@ defmodule RedisServerWrapper.Cluster do
             redis_server_bin: redis_server_bin,
             redis_cli_bin: redis_cli_bin,
             timeout: timeout,
+            managed: managed,
             cluster_enabled: true,
             cluster_config_file: "nodes-#{port}.conf",
             cluster_node_timeout: cluster_node_timeout,
