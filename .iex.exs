@@ -22,7 +22,7 @@ IO.puts("""
 
   Manager (persistent, redis-up style):
     Manager.start_basic(port: 6400)
-    Manager.start_cluster(masters: 3, base_port: 7000)
+    Manager.start_cluster(masters: 3, base_port: 7100)
     Manager.start_sentinel(master_port: 6390)
     Manager.list()
     Manager.info("redis-basic-1")

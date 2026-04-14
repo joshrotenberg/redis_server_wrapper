@@ -57,13 +57,13 @@ RedisServerWrapper.Server.stop(server)
 ### Cluster
 
 ```elixir
-{:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7000)
+{:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7100)
 
 RedisServerWrapper.Cluster.healthy?(cluster)
 #=> true
 
 RedisServerWrapper.Cluster.node_addrs(cluster)
-#=> ["127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7002"]
+#=> ["127.0.0.1:7100", "127.0.0.1:7101", "127.0.0.1:7102"]
 
 RedisServerWrapper.Cluster.stop(cluster)
 ```
@@ -129,7 +129,7 @@ alias RedisServerWrapper.{Chaos, Cluster, Server}
 {:ok, cluster} = RedisServerWrapper.start_cluster(
   masters: 3,
   replicas_per_master: 1,
-  base_port: 7000
+  base_port: 7100
 )
 
 # Kill the master owning a key's hash slot

@@ -74,8 +74,15 @@ defmodule RedisServerWrapper.Cli do
 
   @doc """
   Polls with PING until the server responds or timeout (ms) is reached.
+
+  Returns `{:error, {:unexpected_reply, output}}` if the peer accepts the
+  connection but responds with something other than `PONG` (or a transient
+  `LOADING`/`BUSY` reply). This catches the common case of another service
+  holding the port (e.g. macOS AirPlay on 7000) or a different redis-server
+  with a mismatched password already bound to the port.
   """
-  @spec wait_for_ready(t(), non_neg_integer()) :: :ok | {:error, :timeout}
+  @spec wait_for_ready(t(), non_neg_integer()) ::
+          :ok | {:error, :timeout} | {:error, {:unexpected_reply, String.t()}}
   def wait_for_ready(%__MODULE__{} = cli, timeout_ms \\ 10_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_ready(cli, deadline)
@@ -85,12 +92,40 @@ defmodule RedisServerWrapper.Cli do
     if System.monotonic_time(:millisecond) >= deadline do
       {:error, :timeout}
     else
-      if ping(cli) do
-        :ok
-      else
-        Process.sleep(250)
-        do_wait_for_ready(cli, deadline)
+      case ping_status(cli) do
+        :ready ->
+          :ok
+
+        :not_ready ->
+          Process.sleep(250)
+          do_wait_for_ready(cli, deadline)
+
+        {:unexpected, output} ->
+          {:error, {:unexpected_reply, output}}
       end
+    end
+  end
+
+  # Classify a PING attempt:
+  #   :ready                - got PONG
+  #   :not_ready            - connection refused, or transient LOADING/BUSY reply
+  #   {:unexpected, output} - accepted the connection but replied with
+  #                           something that isn't PONG or a known transient;
+  #                           almost always means the port is held by a
+  #                           different service (or a redis with different auth)
+  defp ping_status(%__MODULE__{} = cli) do
+    case run(cli, ["PING"]) do
+      {:ok, "PONG"} -> :ready
+      {:ok, output} -> classify_ok_reply(output)
+      {:error, _} -> :not_ready
+    end
+  end
+
+  defp classify_ok_reply(output) do
+    cond do
+      output =~ ~r/\bLOADING\b/ -> :not_ready
+      output =~ ~r/\bBUSY\b/ -> :not_ready
+      true -> {:unexpected, output}
     end
   end
 
