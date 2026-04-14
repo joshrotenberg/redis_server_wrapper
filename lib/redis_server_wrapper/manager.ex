@@ -8,7 +8,7 @@ defmodule RedisServerWrapper.Manager do
   ## Usage
 
       Manager.start_basic(port: 6400)
-      Manager.start_cluster(masters: 3, base_port: 7000)
+      Manager.start_cluster(masters: 3, base_port: 7100)
       Manager.start_sentinel(master_port: 6390)
 
       Manager.list()
@@ -121,7 +121,7 @@ defmodule RedisServerWrapper.Manager do
     * `:name` - instance name (auto-generated if omitted)
     * `:masters` - number of masters (default: 3)
     * `:replicas_per_master` - replicas per master (default: 0)
-    * `:base_port` - starting port (default: 7000)
+    * `:base_port` - starting port (default: 7100)
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
   """
@@ -132,7 +132,7 @@ defmodule RedisServerWrapper.Manager do
     password = resolve_password(opts)
     masters = Keyword.get(opts, :masters, 3)
     replicas = Keyword.get(opts, :replicas_per_master, 0)
-    base_port = Keyword.get(opts, :base_port, 7000)
+    base_port = Keyword.get(opts, :base_port, 7100)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
 
     if Map.has_key?(state.instances, name) do

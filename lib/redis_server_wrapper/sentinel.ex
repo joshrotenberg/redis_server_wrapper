@@ -477,6 +477,9 @@ defmodule RedisServerWrapper.Sentinel do
 
           {:error, :timeout} ->
             {:error, {:sentinel_start_timeout, port}}
+
+          {:error, {:unexpected_reply, reply}} ->
+            {:error, {:sentinel_port_in_use, port, reply}}
         end
 
       {output, code} ->

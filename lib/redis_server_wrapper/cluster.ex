@@ -10,7 +10,7 @@ defmodule RedisServerWrapper.Cluster do
       {:ok, pid} = RedisServerWrapper.Cluster.start_link(
         masters: 3,
         replicas_per_master: 1,
-        base_port: 7000
+        base_port: 7100
       )
 
       RedisServerWrapper.Cluster.healthy?(pid)
@@ -21,7 +21,9 @@ defmodule RedisServerWrapper.Cluster do
 
     * `:masters` - number of master nodes (default: 3)
     * `:replicas_per_master` - replicas per master (default: 0)
-    * `:base_port` - starting port (default: 7000)
+    * `:base_port` - starting port (default: 7100). Note: 7000 is avoided
+      because macOS AirPlay Receiver binds it by default, which causes
+      confusing cluster-start failures on Mac.
     * `:bind` - bind address (default: "127.0.0.1")
     * `:password` - Redis password (default: nil)
     * `:redis_server_bin` - redis-server binary path
@@ -114,7 +116,7 @@ defmodule RedisServerWrapper.Cluster do
 
     masters = Keyword.get(opts, :masters, 3)
     replicas = Keyword.get(opts, :replicas_per_master, 0)
-    base_port = Keyword.get(opts, :base_port, 7000)
+    base_port = Keyword.get(opts, :base_port, 7100)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     password = Keyword.get(opts, :password)
 

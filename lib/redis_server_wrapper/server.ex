@@ -354,6 +354,10 @@ defmodule RedisServerWrapper.Server do
       {:error, :timeout} ->
         safe_port_close(port_ref)
         {:error, {:server_start_timeout, config.port}}
+
+      {:error, {:unexpected_reply, reply}} ->
+        safe_port_close(port_ref)
+        {:error, {:port_in_use, config.port, reply}}
     end
   end
 
@@ -406,6 +410,9 @@ defmodule RedisServerWrapper.Server do
 
           {:error, :timeout} ->
             {:error, {:server_start_timeout, config.port}}
+
+          {:error, {:unexpected_reply, reply}} ->
+            {:error, {:port_in_use, config.port, reply}}
         end
 
       {output, code} ->

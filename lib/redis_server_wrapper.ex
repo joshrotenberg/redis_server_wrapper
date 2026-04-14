@@ -13,7 +13,7 @@ defmodule RedisServerWrapper do
       RedisServerWrapper.Server.stop(server)
 
       # Cluster
-      {:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7000)
+      {:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7100)
       RedisServerWrapper.Cluster.healthy?(cluster)
       RedisServerWrapper.Cluster.stop(cluster)
 
