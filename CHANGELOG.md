@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.5.0...v0.6.0) (2026-04-14)
+
+
+### Features
+
+* propagate :managed option through Cluster and Sentinel ([#19](https://github.com/joshrotenberg/redis_server_wrapper/issues/19)) ([5e14774](https://github.com/joshrotenberg/redis_server_wrapper/commit/5e14774e1b4fd944200920f431ce81518dc44435))
+
+
+### Bug Fixes
+
+* detect non-RESP peers in wait_for_ready and move Cluster default off 7000 ([#25](https://github.com/joshrotenberg/redis_server_wrapper/issues/25)) ([fa7d7dd](https://github.com/joshrotenberg/redis_server_wrapper/commit/fa7d7dde72d5c9085cc1fecbc6a1c2d1e6df86e5))
+* reject Server.start_link when port is already bound ([#26](https://github.com/joshrotenberg/redis_server_wrapper/issues/26)) ([c50537d](https://github.com/joshrotenberg/redis_server_wrapper/commit/c50537d9c4b7001e191acd4b1b2251766145319f))
+* stop killing "stale" daemons in unmanaged mode ([#28](https://github.com/joshrotenberg/redis_server_wrapper/issues/28)) ([c7fce5e](https://github.com/joshrotenberg/redis_server_wrapper/commit/c7fce5e456a84f4571d7f0fa32c98d93de28b347))
+
 ## [0.5.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.4.1...v0.5.0) (2026-04-08)
 
 
