@@ -368,13 +368,13 @@ defmodule RedisServerWrapper.Server do
   end
 
   # Daemonized: redis-server forks into background, independent of the BEAM.
+  # No stale-process cleanup here -- in unmanaged mode the caller owns the
+  # lifecycle (instances are intended to outlive this BEAM), and ppid=1 is
+  # the normal state of any live detached redis-server, so a "kill anything
+  # whose pid is in the pidfile" heuristic would silently murder live,
+  # wanted instances. If the port is held, check_port_available returns
+  # {:error, {:port_in_use, ...}} and the caller decides what to do.
   defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
-    # Check for stale process from a previous run before wiping the node dir
-    stale_pidfile =
-      Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
-
-    kill_stale_process(stale_pidfile)
-
     with :ok <- check_port_available(config.bind, config.port) do
       do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
     end
