@@ -297,6 +297,12 @@ defmodule RedisServerWrapper.Server do
 
     kill_stale_process(stale_pidfile)
 
+    with :ok <- check_port_available(config.bind, config.port) do
+      do_start_managed(config, redis_server_bin, redis_cli_bin, timeout)
+    end
+  end
+
+  defp do_start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
     node_dir = make_node_dir(config.port)
 
     config = %{
@@ -369,6 +375,12 @@ defmodule RedisServerWrapper.Server do
 
     kill_stale_process(stale_pidfile)
 
+    with :ok <- check_port_available(config.bind, config.port) do
+      do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
+    end
+  end
+
+  defp do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
     node_dir = make_node_dir(config.port)
     pidfile_path = Path.join(node_dir, "redis.pid")
 
@@ -420,6 +432,32 @@ defmodule RedisServerWrapper.Server do
     end
   end
 
+  # Pre-flight: try to bind the target (bind, port) ourselves to detect the
+  # common case where another process (another redis-server, macOS AirPlay,
+  # a leftover daemon) already holds it. Catches the scenario before we
+  # spawn redis-server and then mistake a foreign PING reply for success.
+  # Still best-effort: there is an inherent TOCTOU race between closing our
+  # probe socket and redis-server binding, and a probe on 127.0.0.1 does
+  # not detect a wildcard-bound peer on the same port. Cli.wait_for_ready's
+  # unexpected-reply handling is the backstop for those cases.
+  defp check_port_available(bind, port) do
+    case :inet.parse_address(to_charlist(bind)) do
+      {:ok, ip} ->
+        case :gen_tcp.listen(port, [:binary, {:ip, ip}, {:active, false}]) do
+          {:ok, sock} ->
+            :gen_tcp.close(sock)
+            :ok
+
+          {:error, reason} ->
+            {:error, {:port_in_use, port, reason}}
+        end
+
+      {:error, _} ->
+        # Non-literal bind (e.g. hostname); skip the probe.
+        :ok
+    end
+  end
+
   defp kill_stale_process(pidfile_path) do
     pidfile_path
     |> read_pidfile()
@@ -429,11 +467,24 @@ defmodule RedisServerWrapper.Server do
   defp maybe_kill_stale(nil), do: :ok
 
   defp maybe_kill_stale(stale_pid) do
-    if pid_alive?(stale_pid) do
+    # Only kill if the process is (a) alive and (b) actually orphaned
+    # (ppid=1). A prior daemonized run re-parents to init, so ppid=1 is
+    # the signal that this is truly stale. Any other parent means it is
+    # a managed Port child of some BEAM -- possibly our own -- and we
+    # must not kill it, or we'd murder a server that was just started on
+    # the same port by the same or a sibling process.
+    if pid_alive?(stale_pid) and orphaned?(stale_pid) do
       Logger.warning("Killing stale redis-server process #{stale_pid}")
       System.cmd("kill", [to_string(stale_pid)], stderr_to_stdout: true)
       Process.sleep(500)
       force_kill_if_alive(stale_pid)
+    end
+  end
+
+  defp orphaned?(pid) do
+    case System.cmd("ps", ["-o", "ppid=", "-p", to_string(pid)], stderr_to_stdout: true) do
+      {out, 0} -> String.trim(out) == "1"
+      _ -> false
     end
   end
 
