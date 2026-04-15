@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.6.0...v0.6.1) (2026-04-15)
+
+
+### Bug Fixes
+
+* load stack modules in unmanaged mode ([#29](https://github.com/joshrotenberg/redis_server_wrapper/issues/29)) ([#30](https://github.com/joshrotenberg/redis_server_wrapper/issues/30)) ([9cf36be](https://github.com/joshrotenberg/redis_server_wrapper/commit/9cf36beb38c706bbc4bc7ff1222bc49e095ede26))
+
 ## [0.6.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.5.0...v0.6.0) (2026-04-14)
 
 
