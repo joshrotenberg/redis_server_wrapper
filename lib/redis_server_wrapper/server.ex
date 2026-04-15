@@ -395,7 +395,12 @@ defmodule RedisServerWrapper.Server do
     conf_path = Path.join(node_dir, "redis.conf")
     File.write!(conf_path, Config.to_config_string(config))
 
-    case System.cmd(redis_server_bin, [conf_path], stderr_to_stdout: true) do
+    server_bin_path = System.find_executable(redis_server_bin) || redis_server_bin
+
+    # If using the redis-stack binary, load the Stack modules
+    module_args = detect_stack_modules(server_bin_path)
+
+    case System.cmd(server_bin_path, [conf_path | module_args], stderr_to_stdout: true) do
       {_output, 0} ->
         cli =
           Cli.new(
