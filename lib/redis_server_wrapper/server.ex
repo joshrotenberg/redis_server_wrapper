@@ -20,9 +20,18 @@ defmodule RedisServerWrapper.Server do
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
     * `:name` - GenServer name registration
     * `:timeout` - startup timeout in ms (default: 10_000)
-    * `:managed` - when `true` (default), redis-server runs as a Port tied to the
-      BEAM lifecycle. When the BEAM exits, the port closes and redis-server receives
-      SIGHUP. When `false`, redis-server daemonizes independently (legacy behavior).
+    * `:managed` - controls how the redis-server OS process is tied to the BEAM:
+      * `true` (default) - redis-server runs as a Port tied to the BEAM lifecycle.
+        When the BEAM exits, the port closes and redis-server receives SIGHUP.
+        Teardown runs in `terminate/2`, which is skipped on a `:brutal_kill`
+        supervisor shutdown or a hard BEAM death, so the OS process can be stranded.
+      * `:forcola` - redis-server runs in the foreground under a `Forcola.Daemon`,
+        which guarantees the OS process group is killed and confirmed dead on owner
+        death or supervisor shutdown, including the paths where `terminate/2` never
+        runs. Requires the optional `:forcola` dependency (`{:forcola, "~> 0.3"}`);
+        `start_link` returns `{:error, :forcola_not_available}` if it is missing.
+      * `false` - redis-server daemonizes independently (legacy behavior); the
+        caller owns the OS process lifecycle.
   """
 
   use GenServer
@@ -40,9 +49,12 @@ defmodule RedisServerWrapper.Server do
     :node_dir,
     :redis_server_bin,
     :port_ref,
+    :daemon,
     managed: true,
     detached: false
   ]
+
+  @type managed :: boolean() | :forcola
 
   @type t :: %__MODULE__{
           config: Config.t(),
@@ -51,7 +63,8 @@ defmodule RedisServerWrapper.Server do
           node_dir: String.t() | nil,
           redis_server_bin: String.t(),
           port_ref: port() | nil,
-          managed: boolean(),
+          daemon: pid() | nil,
+          managed: managed(),
           detached: boolean()
         }
 
@@ -158,8 +171,9 @@ defmodule RedisServerWrapper.Server do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     managed = Keyword.get(opts, :managed, true)
 
-    # Validate binaries exist
-    with :ok <- check_binary(redis_server_bin),
+    # Validate binaries and the managed backend selection
+    with :ok <- validate_managed(managed),
+         :ok <- check_binary(redis_server_bin),
          :ok <- check_binary(redis_cli_bin) do
       config_opts =
         Keyword.drop(opts, [:redis_server_bin, :redis_cli_bin, :name, :timeout, :managed])
@@ -223,6 +237,14 @@ defmodule RedisServerWrapper.Server do
   end
 
   @impl true
+  def handle_info({:EXIT, daemon, reason}, %{daemon: daemon} = state) when is_pid(daemon) do
+    # The Forcola.Daemon child exited (redis-server died on its own). Forcola
+    # maps the child exit to :normal / {:exit_status, n} / {:exit_signal, n};
+    # translate it into a GenServer stop so an OTP restart strategy behaves.
+    Logger.info("Managed (forcola) redis-server exited: #{inspect(reason)}")
+    {:stop, reason, %{state | daemon: nil, pid: nil}}
+  end
+
   def handle_info({:EXIT, _port, _reason}, state) do
     # Ignore port exits from System.cmd calls (trap_exit catches these)
     {:noreply, state}
@@ -243,6 +265,18 @@ defmodule RedisServerWrapper.Server do
   @impl true
   def terminate(_reason, %{detached: true}) do
     Logger.debug("RedisServerWrapper.Server terminating (detached, not stopping redis-server)")
+    :ok
+  end
+
+  def terminate(_reason, %{daemon: daemon} = state) when is_pid(daemon) do
+    # Forcola.Daemon owns teardown: stopping it sends the shim a KILL and blocks
+    # until the whole redis-server process group is confirmed dead (SIGTERM then
+    # SIGKILL). No SHUTDOWN/Port.close/SIGKILL ladder needed on this path.
+    Logger.debug(
+      "RedisServerWrapper.Server terminating, stopping Forcola.Daemon for port #{state.config.port}"
+    )
+
+    stop_daemon(daemon)
     :ok
   end
 
@@ -282,10 +316,10 @@ defmodule RedisServerWrapper.Server do
   # -------------------------------------------------------------------
 
   defp start_redis_server(config, redis_server_bin, redis_cli_bin, timeout, managed) do
-    if managed do
-      start_managed(config, redis_server_bin, redis_cli_bin, timeout)
-    else
-      start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
+    case managed do
+      :forcola -> start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
+      true -> start_managed(config, redis_server_bin, redis_cli_bin, timeout)
+      false -> start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
     end
   end
 
@@ -366,6 +400,92 @@ defmodule RedisServerWrapper.Server do
         {:error, {:port_in_use, config.port, reply}}
     end
   end
+
+  # Forcola-managed: redis-server runs in the foreground under a Forcola.Daemon.
+  # Same foreground contract as the Port path, but the daemon's Rust shim
+  # guarantees the OS process group is killed and confirmed dead on owner death
+  # or supervisor shutdown, including the :brutal_kill and hard-BEAM-death paths
+  # where terminate/2 never runs.
+  defp start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
+    if forcola_available?() do
+      stale_pidfile =
+        Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
+
+      kill_stale_process(stale_pidfile)
+
+      with :ok <- check_port_available(config.bind, config.port) do
+        do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
+      end
+    else
+      {:error, :forcola_not_available}
+    end
+  end
+
+  defp do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
+    node_dir = make_node_dir(config.port)
+
+    config = %{
+      config
+      | daemonize: false,
+        pidfile: Path.join(node_dir, "redis.pid"),
+        dir: node_dir,
+        logfile: config.logfile || Path.join(node_dir, "redis.log")
+    }
+
+    conf_path = Path.join(node_dir, "redis.conf")
+    File.write!(conf_path, Config.to_config_string(config))
+
+    server_bin_path = System.find_executable(redis_server_bin)
+
+    # If using the redis-stack binary, load the Stack modules
+    module_args = detect_stack_modules(server_bin_path)
+
+    cli =
+      Cli.new(
+        bin: redis_cli_bin,
+        host: config.bind,
+        port: config.port,
+        password: config.password
+      )
+
+    daemon_opts = [
+      argv: [server_bin_path, conf_path | module_args],
+      ready: fn -> Cli.ping(cli) end,
+      ready_timeout_ms: timeout,
+      output: :logger,
+      log_output: :debug,
+      log_prefix: "redis-server: "
+    ]
+
+    case Forcola.Daemon.start_link(daemon_opts) do
+      {:ok, daemon} ->
+        state = %__MODULE__{
+          config: config,
+          cli: cli,
+          pid: read_pidfile(Path.join(node_dir, "redis.pid")),
+          node_dir: node_dir,
+          redis_server_bin: redis_server_bin,
+          daemon: daemon,
+          managed: :forcola
+        }
+
+        {:ok, state}
+
+      {:error, :ready_timeout} ->
+        {:error, {:server_start_timeout, config.port}}
+
+      {:error, {:exited_before_ready, reason}} ->
+        {:error, {:server_start_failed, config.port, reason}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp forcola_available?, do: Code.ensure_loaded?(Forcola.Daemon)
+
+  defp validate_managed(managed) when managed in [true, false, :forcola], do: :ok
+  defp validate_managed(other), do: {:error, {:invalid_managed, other}}
 
   # Daemonized: redis-server forks into background, independent of the BEAM.
   # No stale-process cleanup here -- in unmanaged mode the caller owns the
@@ -530,6 +650,15 @@ defmodule RedisServerWrapper.Server do
       {_, 0} -> true
       _ -> false
     end
+  end
+
+  # Stop the linked Forcola.Daemon, triggering its group-kill teardown. The
+  # daemon may already be gone (redis-server exited on its own), so tolerate a
+  # :noproc exit rather than crashing the terminating GenServer.
+  defp stop_daemon(daemon) do
+    if Process.alive?(daemon), do: GenServer.stop(daemon, :normal, :infinity)
+  catch
+    :exit, _ -> :ok
   end
 
   defp safe_port_close(port_ref) do

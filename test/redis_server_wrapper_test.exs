@@ -16,6 +16,14 @@ defmodule RedisServerWrapperTest do
     end
   end
 
+  # Returns the list of PIDs listening on the given TCP port, or [] if none.
+  defp lsof_port(port) do
+    case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
+      {out, 0} -> out |> String.split("\n", trim: true)
+      _ -> []
+    end
+  end
+
   # -------------------------------------------------------------------
   # Config tests (no redis-server needed)
   # -------------------------------------------------------------------
@@ -209,6 +217,57 @@ defmodule RedisServerWrapperTest do
 
       Server.stop(server)
       Process.sleep(500)
+    end
+  end
+
+  describe "Server forcola mode" do
+    test "forcola server starts, pings, and runs commands" do
+      {:ok, server} = Server.start_link(port: 6420, managed: :forcola)
+
+      assert Server.ping(server)
+      assert Server.alive?(server)
+
+      info = Server.info(server)
+      assert info.managed == :forcola
+      assert info.port == 6420
+      assert info.pid != nil
+
+      assert {:ok, "OK"} = Server.run(server, ["SET", "forcola_key", "forcola_val"])
+      assert {:ok, "forcola_val"} = Server.run(server, ["GET", "forcola_key"])
+
+      Server.stop(server)
+      Process.sleep(1000)
+
+      assert lsof_port(6420) == []
+    end
+
+    test "forcola server reaps redis-server when GenServer stops" do
+      {:ok, server} = Server.start_link(port: 6421, managed: :forcola)
+      assert Server.ping(server)
+      assert lsof_port(6421) != []
+
+      Server.stop(server)
+      Process.sleep(1000)
+
+      assert lsof_port(6421) == []
+    end
+
+    # The core guarantee: terminate/2 does NOT run on a :brutal_kill, but the
+    # forcola shim still kills the redis-server process group on owner death,
+    # so the port is released. This is the leak the Port path cannot close.
+    test "forcola server reaps redis-server on a brutal kill (terminate never runs)" do
+      Process.flag(:trap_exit, true)
+      {:ok, server} = Server.start_link(port: 6422, managed: :forcola)
+      assert Server.ping(server)
+      assert lsof_port(6422) != []
+
+      Process.exit(server, :kill)
+
+      assert wait_until(fn -> lsof_port(6422) == [] end, 10, 500)
+    end
+
+    test "invalid managed value yields a clear error" do
+      assert {:error, {:invalid_managed, :bogus}} = Server.start(port: 6423, managed: :bogus)
     end
   end
 
