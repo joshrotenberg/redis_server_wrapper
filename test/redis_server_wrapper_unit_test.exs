@@ -1,7 +1,9 @@
 defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Server}
+  import ExUnit.CaptureLog
+
+  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Server}
 
   setup do
     fixture_dir =
@@ -71,6 +73,7 @@ defmodule RedisServerWrapperUnitTest do
     on_exit(fn -> File.rm_rf!(fixture_dir) end)
 
     {:ok,
+     fixture_dir: fixture_dir,
      cli_bin: cli_bin,
      version_bin: version_bin,
      plain_version_bin: plain_version_bin,
@@ -157,10 +160,114 @@ defmodule RedisServerWrapperUnitTest do
              Server.start(port: 6441, managed: true, redis_server_bin: "false", timeout: 20)
   end
 
+  test "OS process helpers normalize executable results", %{fixture_dir: fixture_dir} do
+    write_executable(
+      fixture_dir,
+      "kill",
+      ~S"""
+      #!/bin/sh
+      if [ "$2" = "123" ]; then
+        exit 0
+      fi
+
+      echo "signal failed"
+      exit 2
+      """
+    )
+
+    write_executable(
+      fixture_dir,
+      "lsof",
+      "#!/bin/sh\nprintf '123\\ninvalid\\n456\\n'\n"
+    )
+
+    write_executable(
+      fixture_dir,
+      "ps",
+      ~S"""
+      #!/bin/sh
+      if [ "$4" = "123" ]; then
+        echo "1"
+      else
+        echo "42"
+      fi
+      """
+    )
+
+    original_path = System.get_env("PATH")
+    on_exit(fn -> restore_path(original_path) end)
+    System.put_env("PATH", fixture_dir)
+
+    assert OSProcess.available?("kill")
+    assert :ok = OSProcess.signal(123, :term)
+    assert :ok = OSProcess.signal(123, :kill)
+    assert :ok = OSProcess.signal(123, :stop)
+    assert :ok = OSProcess.signal(123, :cont)
+
+    assert {:error, {:signal_failed, :term, 999, 2, "signal failed"}} =
+             OSProcess.signal(999, :term)
+
+    assert OSProcess.alive?(123)
+    refute OSProcess.alive?(999)
+    refute OSProcess.alive?(nil)
+    refute OSProcess.alive?(-1)
+    assert OSProcess.orphaned?(123)
+    refute OSProcess.orphaned?(999)
+    assert {:ok, [123, 456]} = OSProcess.pids_on_port(6490)
+  end
+
+  test "missing kill and lsof do not crash teardown or cluster pre-cleanup", %{
+    cli_bin: cli_bin
+  } do
+    redis_server_bin = System.find_executable("redis-server")
+    redis_cli_bin = System.find_executable("redis-cli")
+    false_bin = System.find_executable("false")
+    original_path = System.get_env("PATH")
+    empty_path = Path.join(System.tmp_dir!(), "redis-server-wrapper-no-process-tools")
+    File.mkdir_p!(empty_path)
+
+    on_exit(fn -> restore_path(original_path) end)
+
+    System.put_env("PATH", empty_path)
+
+    refute OSProcess.available?("kill")
+    refute OSProcess.available?("lsof")
+    assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(1, :term)
+    assert {:error, {:executable_not_found, "lsof"}} = OSProcess.pids_on_port(6490)
+    assert is_boolean(OSProcess.alive?(String.to_integer(System.pid())))
+    assert is_boolean(OSProcess.orphaned?(String.to_integer(System.pid())))
+
+    log =
+      capture_log(fn ->
+        assert {:ok, server} =
+                 Server.start_link(
+                   port: 6490,
+                   redis_server_bin: redis_server_bin,
+                   redis_cli_bin: redis_cli_bin
+                 )
+
+        assert :ok = Server.stop(server)
+
+        assert {:error, {:node_start_failed, 7490, _reason}} =
+                 Cluster.start(
+                   masters: 1,
+                   base_port: 7490,
+                   timeout: 20,
+                   redis_server_bin: false_bin,
+                   redis_cli_bin: cli_bin
+                 )
+      end)
+
+    assert log =~ "lsof is unavailable"
+  end
+
   defp write_executable(dir, name, contents) do
     path = Path.join(dir, name)
     File.write!(path, contents)
     File.chmod!(path, 0o755)
     path
   end
+
+  defp restore_path(nil), do: System.delete_env("PATH")
+  defp restore_path(path), do: System.put_env("PATH", path)
 end

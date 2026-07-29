@@ -40,7 +40,7 @@ defmodule RedisServerWrapper.Cluster do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Server}
+  alias RedisServerWrapper.{Cli, OSProcess, Server}
 
   require Logger
 
@@ -320,20 +320,21 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   defp cleanup_ports(ports, bind, redis_cli_bin, password) do
+    unless OSProcess.available?("lsof") do
+      Logger.warning(
+        "lsof is unavailable; Redis Cluster startup will skip best-effort forced port cleanup"
+      )
+    end
+
     Enum.each(ports, fn port ->
       # Try graceful shutdown first
       cli = Cli.new(bin: redis_cli_bin, host: bind, port: port, password: password)
       Cli.shutdown(cli)
 
       # Force kill anything still on this port
-      case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
-        {output, 0} ->
-          output
-          |> String.split("\n", trim: true)
-          |> Enum.each(&System.cmd("kill", ["-9", String.trim(&1)], stderr_to_stdout: true))
-
-        _ ->
-          :ok
+      case OSProcess.pids_on_port(port) do
+        {:ok, pids} -> Enum.each(pids, &OSProcess.signal(&1, :kill))
+        {:error, {:executable_not_found, "lsof"}} -> :ok
       end
     end)
   end

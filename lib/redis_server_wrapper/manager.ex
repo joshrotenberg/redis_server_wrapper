@@ -19,7 +19,9 @@ defmodule RedisServerWrapper.Manager do
   State is stored at `~/.config/redis-server-wrapper/instances.json`.
   """
 
-  alias RedisServerWrapper.{Cli, Cluster, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Sentinel, Server}
+
+  require Logger
 
   @default_state_file Path.expand("~/.config/redis-server-wrapper/instances.json")
 
@@ -535,47 +537,33 @@ defmodule RedisServerWrapper.Manager do
 
     # Then SIGTERM/SIGKILL any remaining PIDs
     Enum.each(instance.pids, fn pid ->
-      if pid_alive?(pid) do
-        System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
-      end
+      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :term)
     end)
 
     Process.sleep(500)
 
     Enum.each(instance.pids, fn pid ->
-      if pid_alive?(pid) do
-        System.cmd("kill", ["-9", to_string(pid)], stderr_to_stdout: true)
-      end
+      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :kill)
     end)
   end
 
   defp check_status(instance) do
-    if Enum.any?(instance.pids, &pid_alive?/1) do
+    if Enum.any?(instance.pids, &OSProcess.alive?/1) do
       :running
     else
       :stopped
     end
   end
 
-  defp pid_alive?(pid) when is_integer(pid) do
-    case System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true) do
-      {_, 0} -> true
-      _ -> false
-    end
-  end
-
-  defp pid_alive?(_), do: false
-
   defp find_pids_on_ports(ports) do
-    Enum.flat_map(ports, fn port ->
-      case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
-        {output, 0} ->
-          output
-          |> String.split(~r/\s+/, trim: true)
-          |> Enum.map(&String.to_integer/1)
+    unless OSProcess.available?("lsof") do
+      Logger.warning("lsof is unavailable; sentinel OS PIDs will not be recorded by port")
+    end
 
-        _ ->
-          []
+    Enum.flat_map(ports, fn port ->
+      case OSProcess.pids_on_port(port) do
+        {:ok, pids} -> pids
+        {:error, {:executable_not_found, "lsof"}} -> []
       end
     end)
     |> Enum.uniq()
