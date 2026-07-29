@@ -41,7 +41,7 @@ defmodule RedisServerWrapper.Sentinel do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Server}
+  alias RedisServerWrapper.{Cli, OSProcess, Server}
 
   require Logger
 
@@ -286,17 +286,14 @@ defmodule RedisServerWrapper.Sentinel do
 
     # Stop sentinels first (they're raw OS processes, not GenServers)
     Enum.each(state.sentinel_os_pids, fn pid ->
-      System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
+      OSProcess.signal(pid, :term)
     end)
 
     Process.sleep(500)
 
     # Force kill any remaining sentinel processes
     Enum.each(state.sentinel_os_pids, fn pid ->
-      case System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true) do
-        {_, 0} -> System.cmd("kill", ["-9", to_string(pid)], stderr_to_stdout: true)
-        _ -> :ok
-      end
+      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :kill)
     end)
 
     # Stop replicas, then master
@@ -447,7 +444,7 @@ defmodule RedisServerWrapper.Sentinel do
 
   defp kill_pids(pids) do
     Enum.each(pids, fn pid ->
-      System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
+      OSProcess.signal(pid, :term)
     end)
   end
 

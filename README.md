@@ -23,6 +23,11 @@ end
 ## Prerequisites
 
 You need `redis-server` and `redis-cli` installed and available on your PATH.
+The wrapper uses `kill`, `ps`, and `lsof` for enhanced process inspection and
+best-effort forced cleanup when they are present, but normal server, cluster,
+and sentinel lifecycle operations degrade safely when minimal runtime images
+omit them. Signal-based functions in `RedisServerWrapper.Chaos` still require
+`kill`.
 
 ```bash
 # macOS

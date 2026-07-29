@@ -38,7 +38,7 @@ defmodule RedisServerWrapper.Server do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config}
+  alias RedisServerWrapper.{Cli, Config, OSProcess}
 
   require Logger
 
@@ -202,7 +202,7 @@ defmodule RedisServerWrapper.Server do
   end
 
   def handle_call(:alive?, _from, state) do
-    {:reply, pid_alive?(state.pid), state}
+    {:reply, OSProcess.alive?(state.pid), state}
   end
 
   def handle_call({:run, args}, _from, state) do
@@ -302,12 +302,12 @@ defmodule RedisServerWrapper.Server do
     # Force kill if still alive.
     # Use kill on the process group (-pid) to also catch child processes.
     # This handles redis-stack-server (bash wrapper) which spawns a child redis-server.
-    if state.pid && pid_alive?(state.pid) do
+    if state.pid && OSProcess.alive?(state.pid) do
       Logger.warning("redis-server PID #{state.pid} still alive after SHUTDOWN, sending SIGKILL")
       # Kill the process group (negative PID) to get wrapper + child
-      System.cmd("kill", ["-9", "-#{state.pid}"], stderr_to_stdout: true)
+      warn_if_signal_unavailable(OSProcess.signal(-state.pid, :kill), state.pid)
       # Also try the individual PID in case process group kill didn't work
-      System.cmd("kill", ["-9", to_string(state.pid)], stderr_to_stdout: true)
+      warn_if_signal_unavailable(OSProcess.signal(state.pid, :kill), state.pid)
     end
 
     # Extra safety: find and kill any redis-server on our port
@@ -610,25 +610,18 @@ defmodule RedisServerWrapper.Server do
     # a managed Port child of some BEAM -- possibly our own -- and we
     # must not kill it, or we'd murder a server that was just started on
     # the same port by the same or a sibling process.
-    if pid_alive?(stale_pid) and orphaned?(stale_pid) do
+    if OSProcess.alive?(stale_pid) and OSProcess.orphaned?(stale_pid) do
       Logger.warning("Killing stale redis-server process #{stale_pid}")
-      System.cmd("kill", [to_string(stale_pid)], stderr_to_stdout: true)
+      warn_if_signal_unavailable(OSProcess.signal(stale_pid, :term), stale_pid)
       Process.sleep(500)
       force_kill_if_alive(stale_pid)
     end
   end
 
-  defp orphaned?(pid) do
-    case System.cmd("ps", ["-o", "ppid=", "-p", to_string(pid)], stderr_to_stdout: true) do
-      {out, 0} -> String.trim(out) == "1"
-      _ -> false
-    end
-  end
-
   defp force_kill_if_alive(pid) do
-    if pid_alive?(pid) do
+    if OSProcess.alive?(pid) do
       Logger.warning("Stale PID #{pid} still alive, sending SIGKILL")
-      System.cmd("kill", ["-9", to_string(pid)], stderr_to_stdout: true)
+      warn_if_signal_unavailable(OSProcess.signal(pid, :kill), pid)
     end
   end
 
@@ -655,15 +648,6 @@ defmodule RedisServerWrapper.Server do
     end
   end
 
-  defp pid_alive?(nil), do: false
-
-  defp pid_alive?(pid) do
-    case System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true) do
-      {_, 0} -> true
-      _ -> false
-    end
-  end
-
   # Stop the linked Forcola.Daemon, triggering its group-kill teardown. The
   # daemon may already be gone (redis-server exited on its own), so tolerate a
   # :noproc exit rather than crashing the terminating GenServer.
@@ -684,22 +668,29 @@ defmodule RedisServerWrapper.Server do
   # Kill any redis-server process listening on a specific port.
   # This handles orphaned processes from wrapper scripts (redis-stack-server).
   defp kill_by_port(port) when is_integer(port) do
-    case System.cmd("lsof", ["-ti", ":#{port}"], stderr_to_stdout: true) do
-      {output, 0} ->
-        output
-        |> String.split("\n", trim: true)
-        |> Enum.each(fn pid_str ->
-          System.cmd("kill", ["-9", String.trim(pid_str)], stderr_to_stdout: true)
+    case OSProcess.pids_on_port(port) do
+      {:ok, pids} ->
+        Enum.each(pids, fn pid ->
+          warn_if_signal_unavailable(OSProcess.signal(pid, :kill), pid)
         end)
 
-      _ ->
-        :ok
+      {:error, {:executable_not_found, "lsof"}} ->
+        Logger.warning(
+          "lsof is unavailable; skipping best-effort process cleanup for Redis port #{port}"
+        )
     end
-  rescue
-    _ -> :ok
   end
 
   defp kill_by_port(_), do: :ok
+
+  defp warn_if_signal_unavailable(
+         {:error, {:executable_not_found, "kill"}},
+         pid
+       ) do
+    Logger.warning("kill is unavailable; unable to signal Redis process #{pid}")
+  end
+
+  defp warn_if_signal_unavailable(_result, _pid), do: :ok
 
   # Detect Redis Stack modules (RedisJSON, RediSearch, etc.) if we're using
   # the redis-stack binary. Returns command-line args like
