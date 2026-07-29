@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.1...v0.7.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* silence optional Forcola compile warning ([#46](https://github.com/joshrotenberg/redis_server_wrapper/issues/46)) ([aef3605](https://github.com/joshrotenberg/redis_server_wrapper/commit/aef3605cf0c2b569086bd0d7a5d9faad5cfe64fe))
+
 ## [0.7.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.0...v0.7.1) (2026-07-29)
 
 
