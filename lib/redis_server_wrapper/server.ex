@@ -42,6 +42,9 @@ defmodule RedisServerWrapper.Server do
 
   require Logger
 
+  # Forcola is an optional dependency guarded by forcola_available?/0.
+  @compile {:no_warn_undefined, Forcola.Daemon}
+
   @default_timeout 10_000
 
   defstruct [
