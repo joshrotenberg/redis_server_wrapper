@@ -103,8 +103,21 @@ RedisServerWrapper.Manager.start_basic(name: "dev-redis", port: 6400)
 RedisServerWrapper.Manager.list()
 #=> [%{name: "dev-redis", type: :basic, ...}]
 
+RedisServerWrapper.Manager.credentials("dev-redis")
+#=> {:ok, %{password: "password", url: "redis://:password@127.0.0.1:6400"}}
+
 RedisServerWrapper.Manager.stop("dev-redis")
 ```
+
+Manager-generated passwords come from the operating system's cryptographic
+random source. Console output redacts credentials; use `Manager.credentials/1`
+when plaintext access is intentional. The Manager state directory and
+credential-bearing Redis configuration directories are created with mode
+`0700`, while state and configuration files use `0600`. State updates are
+atomic and serialized across connected BEAM nodes. Independent, unconnected
+BEAM instances must not write to the same Manager state file concurrently.
+Invalid state is moved aside as an `instances.json.corrupt-*` recovery copy
+instead of being overwritten.
 
 ### Managed Process Lifecycle
 

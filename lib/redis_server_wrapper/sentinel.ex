@@ -41,7 +41,7 @@ defmodule RedisServerWrapper.Sentinel do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, OSProcess, Server}
+  alias RedisServerWrapper.{Cli, OSProcess, SecureFile, Server}
 
   require Logger
 
@@ -378,7 +378,7 @@ defmodule RedisServerWrapper.Sentinel do
         "sentinel-#{System.system_time(:nanosecond)}"
       ])
 
-    File.mkdir_p!(sentinel_dir)
+    SecureFile.make_private_directory!(sentinel_dir)
 
     results =
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
@@ -402,11 +402,11 @@ defmodule RedisServerWrapper.Sentinel do
 
   defp start_single_sentinel(opts, sentinel_dir, port) do
     node_dir = Path.join(sentinel_dir, "sentinel-#{port}")
-    File.mkdir_p!(node_dir)
+    SecureFile.make_private_directory!(node_dir)
 
     conf_content = generate_sentinel_conf(opts, node_dir, port)
     conf_path = Path.join(node_dir, "sentinel.conf")
-    File.write!(conf_path, conf_content)
+    SecureFile.write_private!(conf_path, conf_content)
 
     start_sentinel_process(
       opts.redis_server_bin,
@@ -468,7 +468,19 @@ defmodule RedisServerWrapper.Sentinel do
          port,
          timeout
        ) do
-    case System.cmd(redis_server_bin, [conf_path, "--sentinel"], stderr_to_stdout: true) do
+    # Sentinel rewrites its configuration as topology state changes. Launch it
+    # with a private umask so every replacement keeps credential-bearing config
+    # private, not only the initial file written above.
+    command_args = [
+      "-c",
+      ~S(umask 077; exec "$@"),
+      "redis-server-wrapper",
+      redis_server_bin,
+      conf_path,
+      "--sentinel"
+    ]
+
+    case System.cmd("/bin/sh", command_args, stderr_to_stdout: true) do
       {_output, 0} ->
         # Wait for sentinel to be ready
         cli = Cli.new(bin: redis_cli_bin, host: bind, port: port)

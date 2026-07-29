@@ -34,7 +34,7 @@ defmodule RedisServerWrapper.Cli do
   def run(%__MODULE__{} = cli, args) when is_list(args) do
     full_args = base_args(cli) ++ args
 
-    case System.cmd(cli.bin, full_args, stderr_to_stdout: true) do
+    case run_command(cli, full_args) do
       {output, 0} -> {:ok, String.trim(output)}
       {output, _code} -> {:error, String.trim(output)}
     end
@@ -138,10 +138,9 @@ defmodule RedisServerWrapper.Cli do
     args =
       ["--cluster", "create"] ++
         node_addrs ++
-        ["--cluster-replicas", to_string(replicas_per_master), "--cluster-yes"] ++
-        auth_args(cli)
+        ["--cluster-replicas", to_string(replicas_per_master), "--cluster-yes"]
 
-    case System.cmd(cli.bin, args, stderr_to_stdout: true) do
+    case run_command(cli, args) do
       {output, 0} -> {:ok, String.trim(output)}
       {output, _code} -> {:error, String.trim(output)}
     end
@@ -172,12 +171,20 @@ defmodule RedisServerWrapper.Cli do
   # Build base connection arguments for redis-cli
   defp base_args(%__MODULE__{} = cli) do
     ["-h", cli.host, "-p", to_string(cli.port)]
-    |> maybe_append(cli.password, fn pw -> ["-a", pw, "--no-auth-warning"] end)
     |> maybe_append(cli.tls, fn _ -> ["--tls"] end)
   end
 
-  defp auth_args(%__MODULE__{password: nil}), do: []
-  defp auth_args(%__MODULE__{password: pw}), do: ["-a", pw, "--no-auth-warning"]
+  defp run_command(cli, args) do
+    System.cmd(
+      cli.bin,
+      args,
+      stderr_to_stdout: true,
+      env: auth_env(cli)
+    )
+  end
+
+  defp auth_env(%__MODULE__{password: nil}), do: []
+  defp auth_env(%__MODULE__{password: password}), do: [{"REDISCLI_AUTH", password}]
 
   defp maybe_append(args, nil, _fun), do: args
   defp maybe_append(args, false, _fun), do: args

@@ -16,10 +16,13 @@ defmodule RedisServerWrapper.Manager do
       Manager.stop("redis-basic-1")
       Manager.cleanup()
 
-  State is stored at `~/.config/redis-server-wrapper/instances.json`.
+  State is stored at `~/.config/redis-server-wrapper/instances.json`. Mutating
+  operations are serialized within a connected BEAM cluster and use atomic
+  file replacement. Independent, unconnected BEAM instances must not write to
+  the same state file concurrently.
   """
 
-  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, OSProcess, SecureFile, Sentinel, Server}
 
   require Logger
 
@@ -58,6 +61,10 @@ defmodule RedisServerWrapper.Manager do
   """
   @spec start_basic(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_basic(opts \\ []) do
+    with_state_lock(fn -> do_start_basic(opts) end)
+  end
+
+  defp do_start_basic(opts) do
     state = load_state()
     name = Keyword.get(opts, :name) || generate_name(state, :basic)
     password = resolve_password(opts)
@@ -131,6 +138,10 @@ defmodule RedisServerWrapper.Manager do
   """
   @spec start_cluster(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_cluster(opts \\ []) do
+    with_state_lock(fn -> do_start_cluster(opts) end)
+  end
+
+  defp do_start_cluster(opts) do
     state = load_state()
     name = Keyword.get(opts, :name) || generate_name(state, :cluster)
     password = resolve_password(opts)
@@ -209,6 +220,10 @@ defmodule RedisServerWrapper.Manager do
   """
   @spec start_sentinel(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_sentinel(opts \\ []) do
+    with_state_lock(fn -> do_start_sentinel(opts) end)
+  end
+
+  defp do_start_sentinel(opts) do
     state = load_state()
     name = Keyword.get(opts, :name) || generate_name(state, :sentinel)
     password = resolve_password(opts)
@@ -339,10 +354,38 @@ defmodule RedisServerWrapper.Manager do
   end
 
   @doc """
+  Returns the credentials for a named instance without printing them.
+
+  Manager console output is redacted by default. Use this function when a
+  caller explicitly needs the plaintext password or connection URL.
+  """
+  @spec credentials(String.t()) ::
+          {:ok, %{password: String.t() | nil, url: String.t()}} | {:error, :not_found}
+  def credentials(name) do
+    state = load_state()
+
+    case Map.get(state.instances, name) do
+      nil ->
+        {:error, :not_found}
+
+      instance ->
+        {:ok,
+         %{
+           password: instance.password,
+           url: build_url(instance.bind, List.first(instance.ports), instance.password)
+         }}
+    end
+  end
+
+  @doc """
   Stops a named instance by sending SHUTDOWN to all its processes.
   """
   @spec stop(String.t()) :: :ok | {:error, term()}
   def stop(name) do
+    with_state_lock(fn -> do_stop(name) end)
+  end
+
+  defp do_stop(name) do
     state = load_state()
 
     case Map.get(state.instances, name) do
@@ -367,6 +410,10 @@ defmodule RedisServerWrapper.Manager do
   """
   @spec stop_all() :: :ok | {:error, {:instances_not_stopped, map()}}
   def stop_all do
+    with_state_lock(&do_stop_all/0)
+  end
+
+  defp do_stop_all do
     state = load_state()
 
     {remaining, failures} =
@@ -399,6 +446,10 @@ defmodule RedisServerWrapper.Manager do
   """
   @spec cleanup() :: {non_neg_integer(), non_neg_integer()}
   def cleanup do
+    with_state_lock(&do_cleanup/0)
+  end
+
+  defp do_cleanup do
     state = load_state()
 
     {running, dead} =
@@ -422,28 +473,95 @@ defmodule RedisServerWrapper.Manager do
 
   defp load_state do
     state_file = state_file()
-    File.mkdir_p!(Path.dirname(state_file))
+    ensure_state_directory!(state_file)
 
-    case File.read(state_file) do
-      {:ok, content} when byte_size(content) > 0 ->
-        data = JSON.decode!(content)
-        deserialize_state(data)
+    case SecureFile.harden_private_file(state_file) do
+      :ok ->
+        read_state_file(state_file)
 
-      _ ->
+      :missing ->
         empty_state()
+
+      {:error, reason} ->
+        recover_corrupt_state(state_file, reason)
     end
   end
 
   defp save_state(state) do
     state_file = state_file()
-    File.mkdir_p!(Path.dirname(state_file))
+    ensure_state_directory!(state_file)
     json = encode_json(serialize_state(state))
-    File.write!(state_file, json)
+    SecureFile.atomic_write_private!(state_file, json)
     state
+  end
+
+  defp read_state_file(state_file) do
+    case File.read(state_file) do
+      {:ok, ""} ->
+        empty_state()
+
+      {:ok, content} ->
+        decode_state(state_file, content)
+
+      {:error, :enoent} ->
+        empty_state()
+
+      {:error, reason} ->
+        recover_corrupt_state(state_file, reason)
+    end
+  end
+
+  defp decode_state(state_file, content) do
+    case JSON.decode(content) do
+      {:ok, data} ->
+        deserialize_state(data)
+
+      {:error, reason} ->
+        recover_corrupt_state(state_file, reason)
+    end
+  rescue
+    error -> recover_corrupt_state(state_file, Exception.message(error))
+  end
+
+  defp recover_corrupt_state(state_file, reason) do
+    backup = "#{state_file}.corrupt-#{System.unique_integer([:positive, :monotonic])}"
+
+    case File.rename(state_file, backup) do
+      :ok ->
+        Logger.error(
+          "Manager state was invalid and has been preserved at #{backup}: #{inspect(reason)}"
+        )
+
+      {:error, :enoent} ->
+        Logger.warning("Manager state disappeared while recovering invalid data")
+
+      {:error, rename_reason} ->
+        raise File.Error,
+          reason: rename_reason,
+          action: "preserve invalid Manager state",
+          path: state_file
+    end
+
+    empty_state()
+  end
+
+  defp ensure_state_directory!(state_file) do
+    directory = Path.dirname(state_file)
+    directory_existed? = File.dir?(directory)
+    File.mkdir_p!(directory)
+
+    if not directory_existed? or Path.expand(state_file) == Path.expand(@default_state_file) do
+      File.chmod!(directory, 0o700)
+    end
   end
 
   defp state_file do
     Application.get_env(:redis_server_wrapper, :manager_state_file, @default_state_file)
+  end
+
+  defp with_state_lock(fun) do
+    resource = {__MODULE__, Path.expand(state_file())}
+    :global.trans({resource, self()}, fun)
   end
 
   defp empty_state, do: %{instances: %{}, counters: %{}}
@@ -457,20 +575,26 @@ defmodule RedisServerWrapper.Manager do
     %{"instances" => instances, "counters" => state.counters}
   end
 
-  defp deserialize_state(data) do
+  defp deserialize_state(%{"instances" => instances} = data) when is_map(instances) do
     instances =
-      (data["instances"] || %{})
-      |> Map.new(fn {name, inst} -> {name, deserialize_instance(name, inst)} end)
+      Map.new(instances, fn {name, inst} -> {name, deserialize_instance(name, inst)} end)
 
     counters = data["counters"] || %{}
 
-    %{instances: instances, counters: counters}
+    if is_map(counters) do
+      %{instances: instances, counters: counters}
+    else
+      raise ArgumentError, "Manager state counters must be an object"
+    end
   end
 
-  defp deserialize_instance(name, inst) do
+  defp deserialize_state(%{} = data) when map_size(data) == 0, do: empty_state()
+  defp deserialize_state(_data), do: raise(ArgumentError, "Manager state must be an object")
+
+  defp deserialize_instance(name, inst) when is_map(inst) do
     %{
       name: inst["name"] || name,
-      type: String.to_existing_atom(inst["type"] || "basic"),
+      type: deserialize_type(inst["type"] || "basic"),
       created_at: inst["created_at"],
       bind: inst["bind"] || "127.0.0.1",
       ports: inst["ports"] || [],
@@ -481,15 +605,29 @@ defmodule RedisServerWrapper.Manager do
     }
   end
 
+  defp deserialize_instance(_name, _inst),
+    do: raise(ArgumentError, "Manager instance state must be an object")
+
+  defp deserialize_type("basic"), do: :basic
+  defp deserialize_type("cluster"), do: :cluster
+  defp deserialize_type("sentinel"), do: :sentinel
+  defp deserialize_type(type), do: raise(ArgumentError, "unknown Manager instance type: #{type}")
+
   defp atomize_keys(map) when is_map(map) do
     Map.new(map, fn
-      {k, v} when is_binary(k) -> {String.to_atom(k), atomize_keys(v)}
+      {k, v} when is_binary(k) -> {existing_atom_or_string(k), atomize_keys(v)}
       {k, v} -> {k, atomize_keys(v)}
     end)
   end
 
   defp atomize_keys(list) when is_list(list), do: Enum.map(list, &atomize_keys/1)
   defp atomize_keys(value), do: value
+
+  defp existing_atom_or_string(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> key
+  end
 
   defp encode_json(data) do
     JSON.encode!(data)
@@ -537,11 +675,10 @@ defmodule RedisServerWrapper.Manager do
     end
   end
 
-  @password_chars ~c"bcdfghjkmnpqrstvwxyz23456789BCDFGHJKMNPQRSTVWXYZ"
   defp generate_password(length \\ 16) do
-    for _ <- 1..length, into: "" do
-      <<Enum.random(@password_chars)>>
-    end
+    :crypto.strong_rand_bytes(length)
+    |> Base.url_encode64(padding: false)
+    |> binary_part(0, length)
   end
 
   # -------------------------------------------------------------------
@@ -670,8 +807,20 @@ defmodule RedisServerWrapper.Manager do
   # URL building
   # -------------------------------------------------------------------
 
-  defp build_url(host, port, nil), do: "redis://#{host}:#{port}"
-  defp build_url(host, port, password), do: "redis://:#{password}@#{host}:#{port}"
+  defp build_url(host, port, nil), do: "redis://#{url_host(host)}:#{port}"
+
+  defp build_url(host, port, password) do
+    encoded_password = URI.encode(password, &URI.char_unreserved?/1)
+    "redis://:#{encoded_password}@#{url_host(host)}:#{port}"
+  end
+
+  defp url_host(host) do
+    if String.contains?(host, ":") and not String.starts_with?(host, "[") do
+      "[#{host}]"
+    else
+      host
+    end
+  end
 
   # -------------------------------------------------------------------
   # Display helpers
@@ -680,12 +829,12 @@ defmodule RedisServerWrapper.Manager do
   defp print_instance(instance) do
     IO.puts("")
     IO.puts("  #{instance.name} (#{instance.type})")
-    IO.puts("  URL: #{instance.url}")
+    IO.puts("  URL: #{redact_url(instance.url)}")
     IO.puts("  Ports: #{Enum.join(instance.ports, ", ")}")
     IO.puts("  PIDs: #{Enum.join(instance.pids, ", ")}")
 
     if instance.password do
-      IO.puts("  Password: #{instance.password}")
+      IO.puts("  Password: [REDACTED]")
     end
 
     IO.puts("")
@@ -705,13 +854,13 @@ defmodule RedisServerWrapper.Manager do
     IO.puts("  #{instance.name}")
     IO.puts("  Type:     #{instance.type}")
     IO.puts("  Status:   #{instance.status}")
-    IO.puts("  URL:      #{instance.url}")
+    IO.puts("  URL:      #{redact_url(instance.url)}")
     IO.puts("  Ports:    #{Enum.join(instance.ports, ", ")}")
     IO.puts("  PIDs:     #{Enum.join(instance.pids, ", ")}")
     IO.puts("  Created:  #{instance.created_at}")
 
     if instance.password do
-      IO.puts("  Password: #{instance.password}")
+      IO.puts("  Password: [REDACTED]")
     end
 
     if map_size(instance.metadata) > 0 do
@@ -719,6 +868,10 @@ defmodule RedisServerWrapper.Manager do
     end
 
     IO.puts("")
+  end
+
+  defp redact_url(url) do
+    String.replace(url, ~r/\A(redis(?:s)?:\/\/)[^@]+@/, "\\1[REDACTED]@")
   end
 
   # -------------------------------------------------------------------
