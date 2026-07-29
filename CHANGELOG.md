@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.0...v0.7.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* allow immediate managed Redis restarts ([#43](https://github.com/joshrotenberg/redis_server_wrapper/issues/43)) ([77d54df](https://github.com/joshrotenberg/redis_server_wrapper/commit/77d54dfac0548b169eb4b14ea742a2366d9282ec))
+
 ## [0.7.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.6.1...v0.7.0) (2026-07-29)
 
 
