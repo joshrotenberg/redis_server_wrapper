@@ -37,7 +37,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/redis-server-wrapper/redis-${{ matrix.redis }}
-          key: redis-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
+          key: redis-tls-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
 
       - name: Build Redis ${{ matrix.redis }}
         run: |
@@ -114,7 +114,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/redis-server-wrapper/redis-${{ matrix.redis }}
-          key: redis-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
+          key: redis-tls-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
 
       - name: Build Redis ${{ matrix.redis }}
         run: |
