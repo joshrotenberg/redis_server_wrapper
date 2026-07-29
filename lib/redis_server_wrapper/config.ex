@@ -22,6 +22,8 @@ defmodule RedisServerWrapper.Config do
   @type bind_addresses :: String.t() | [String.t()]
   @type extra_spec :: {String.t(), String.t() | [String.t()]}
 
+  alias RedisServerWrapper.Connection
+
   # These validators intentionally defend the runtime struct boundary against
   # values outside the public typespec.
   @dialyzer {:nowarn_function, validate_save!: 1}
@@ -32,6 +34,7 @@ defmodule RedisServerWrapper.Config do
           port: non_neg_integer(),
           bind: bind_addresses(),
           control_host: String.t() | nil,
+          username: String.t() | nil,
           password: String.t() | nil,
           loglevel: log_level(),
           logfile: String.t() | nil,
@@ -56,9 +59,17 @@ defmodule RedisServerWrapper.Config do
           tls_cert_file: String.t() | nil,
           tls_key_file: String.t() | nil,
           tls_ca_cert_file: String.t() | nil,
+          tls_ca_cert_dir: String.t() | nil,
           tls_auth_clients: String.t() | nil,
+          tls_client_cert_file: String.t() | nil,
+          tls_client_key_file: String.t() | nil,
+          tls_server_name: String.t() | nil,
+          tls_insecure: boolean(),
+          tls_replication: boolean(),
+          tls_cluster: boolean(),
           # Replication
           replicaof: {String.t(), non_neg_integer()} | nil,
+          masteruser: String.t() | nil,
           masterauth: String.t() | nil,
           # Cluster
           cluster_enabled: boolean(),
@@ -76,6 +87,7 @@ defmodule RedisServerWrapper.Config do
   defstruct port: 6379,
             bind: "127.0.0.1",
             control_host: nil,
+            username: nil,
             password: nil,
             loglevel: :notice,
             logfile: nil,
@@ -96,8 +108,16 @@ defmodule RedisServerWrapper.Config do
             tls_cert_file: nil,
             tls_key_file: nil,
             tls_ca_cert_file: nil,
+            tls_ca_cert_dir: nil,
             tls_auth_clients: nil,
+            tls_client_cert_file: nil,
+            tls_client_key_file: nil,
+            tls_server_name: nil,
+            tls_insecure: false,
+            tls_replication: false,
+            tls_cluster: false,
             replicaof: nil,
+            masteruser: nil,
             masterauth: nil,
             cluster_enabled: false,
             cluster_config_file: nil,
@@ -146,6 +166,38 @@ defmodule RedisServerWrapper.Config do
   @spec listen_addresses(t()) :: [String.t()]
   def listen_addresses(%__MODULE__{bind: bind}), do: bind_tokens(bind)
 
+  @doc "Builds the client connection used to control this Redis server."
+  @spec connection(t()) :: Connection.t()
+  def connection(%__MODULE__{} = config) do
+    common = [
+      username: config.username,
+      password: config.password
+    ]
+
+    cond do
+      is_integer(config.tls_port) and config.tls_port > 0 ->
+        Connection.new(
+          [
+            transport: :tls,
+            host: control_host(config),
+            port: config.tls_port,
+            tls_ca_cert_file: config.tls_ca_cert_file,
+            tls_ca_cert_dir: config.tls_ca_cert_dir,
+            tls_client_cert_file: config.tls_client_cert_file,
+            tls_client_key_file: config.tls_client_key_file,
+            tls_server_name: config.tls_server_name,
+            tls_insecure: config.tls_insecure
+          ] ++ common
+        )
+
+      is_integer(config.port) and config.port > 0 ->
+        Connection.new([transport: :tcp, host: control_host(config), port: config.port] ++ common)
+
+      is_binary(config.unixsocket) ->
+        Connection.new([transport: :unix, socket: config.unixsocket] ++ common)
+    end
+  end
+
   @doc """
   Encodes one Redis configuration directive from an argument vector.
 
@@ -166,7 +218,7 @@ defmodule RedisServerWrapper.Config do
     []
     |> emit("port", config.port)
     |> emit("bind", bind_tokens(config.bind))
-    |> emit_if("requirepass", config.password)
+    |> emit_auth(config)
     |> emit("loglevel", config.loglevel)
     |> emit_if("logfile", config.logfile)
     |> emit("daemonize", yn(config.daemonize))
@@ -212,6 +264,20 @@ defmodule RedisServerWrapper.Config do
     end)
   end
 
+  defp emit_auth(acc, %{username: nil, password: password}) do
+    emit_if(acc, "requirepass", password)
+  end
+
+  defp emit_auth(acc, %{username: "default", password: password}) do
+    emit(acc, "user", ["default", "on", ">#{password}", "~*", "&*", "+@all"])
+  end
+
+  defp emit_auth(acc, %{username: username, password: password}) do
+    acc
+    |> emit("user", ["default", "off"])
+    |> emit("user", [username, "on", ">#{password}", "~*", "&*", "+@all"])
+  end
+
   defp emit_tls(acc, %{tls_port: nil}), do: acc
 
   defp emit_tls(acc, config) do
@@ -220,7 +286,10 @@ defmodule RedisServerWrapper.Config do
     |> emit_if("tls-cert-file", config.tls_cert_file)
     |> emit_if("tls-key-file", config.tls_key_file)
     |> emit_if("tls-ca-cert-file", config.tls_ca_cert_file)
+    |> emit_if("tls-ca-cert-dir", config.tls_ca_cert_dir)
     |> emit_if("tls-auth-clients", config.tls_auth_clients)
+    |> emit_if_true("tls-replication", config.tls_replication)
+    |> emit_if_true("tls-cluster", config.tls_cluster)
   end
 
   defp emit_replication(acc, %{replicaof: nil}), do: acc
@@ -230,6 +299,7 @@ defmodule RedisServerWrapper.Config do
 
     acc
     |> emit("replicaof", [host, port])
+    |> emit_if("masteruser", config.masteruser)
     |> emit_if("masterauth", config.masterauth)
   end
 
@@ -264,10 +334,11 @@ defmodule RedisServerWrapper.Config do
   end
 
   @reserved_directives MapSet.new(~w(
-    port bind requirepass loglevel logfile daemonize pidfile dir save
+    port bind requirepass user loglevel logfile daemonize pidfile dir save
     appendonly appendfsync maxmemory maxmemory-policy tcp-backlog timeout
     tcp-keepalive unixsocket unixsocketperm tls-port tls-cert-file
-    tls-key-file tls-ca-cert-file tls-auth-clients replicaof masterauth
+    tls-key-file tls-ca-cert-file tls-ca-cert-dir tls-auth-clients
+    tls-replication tls-cluster replicaof masteruser masterauth
     cluster-enabled cluster-config-file cluster-node-timeout
     cluster-announce-hostname cluster-announce-port cluster-announce-bus-port
     loadmodule
@@ -279,7 +350,10 @@ defmodule RedisServerWrapper.Config do
     validate_boolean!(:daemonize, config.daemonize)
     validate_boolean!(:appendonly, config.appendonly)
     validate_boolean!(:cluster_enabled, config.cluster_enabled)
-    validate_port!(:port, config.port)
+    validate_boolean!(:tls_insecure, config.tls_insecure)
+    validate_boolean!(:tls_replication, config.tls_replication)
+    validate_boolean!(:tls_cluster, config.tls_cluster)
+    validate_listen_port!(:port, config.port)
 
     Enum.each(
       [
@@ -305,6 +379,7 @@ defmodule RedisServerWrapper.Config do
 
     Enum.each(
       [
+        username: config.username,
         password: config.password,
         logfile: config.logfile,
         pidfile: config.pidfile,
@@ -316,7 +391,12 @@ defmodule RedisServerWrapper.Config do
         tls_cert_file: config.tls_cert_file,
         tls_key_file: config.tls_key_file,
         tls_ca_cert_file: config.tls_ca_cert_file,
+        tls_ca_cert_dir: config.tls_ca_cert_dir,
         tls_auth_clients: config.tls_auth_clients,
+        tls_client_cert_file: config.tls_client_cert_file,
+        tls_client_key_file: config.tls_client_key_file,
+        tls_server_name: config.tls_server_name,
+        masteruser: config.masteruser,
         masterauth: config.masterauth,
         cluster_config_file: config.cluster_config_file,
         cluster_announce_hostname: config.cluster_announce_hostname
@@ -325,7 +405,12 @@ defmodule RedisServerWrapper.Config do
     )
 
     validate_save!(config.save)
+    validate_auth!(config)
+    validate_tls!(config)
+    validate_endpoint!(config)
+    validate_unix_socket!(config.unixsocket)
     validate_replicaof!(config.replicaof)
+    validate_replication_auth!(config)
     validate_modules!(config.loadmodule)
     validate_extra!(config.extra)
   end
@@ -346,6 +431,14 @@ defmodule RedisServerWrapper.Config do
 
   defp validate_port!(field, value) do
     raise ArgumentError, ":#{field} must be an integer from 1 to 65535, got: #{inspect(value)}"
+  end
+
+  defp validate_listen_port!(_field, value)
+       when is_integer(value) and value in 0..65_535,
+       do: :ok
+
+  defp validate_listen_port!(field, value) do
+    raise ArgumentError, ":#{field} must be an integer from 0 to 65535, got: #{inspect(value)}"
   end
 
   defp validate_optional_port!(_field, nil), do: :ok
@@ -387,6 +480,9 @@ defmodule RedisServerWrapper.Config do
     host = control_host(config)
 
     cond do
+      config.port == 0 and is_nil(config.tls_port) ->
+        :ok
+
       not is_binary(host) or host == "" or Regex.match?(~r/\s/u, host) ->
         raise ArgumentError, ":control_host must resolve to one non-empty address"
 
@@ -397,6 +493,116 @@ defmodule RedisServerWrapper.Config do
       true ->
         :ok
     end
+  end
+
+  defp validate_auth!(%{username: nil}), do: :ok
+
+  defp validate_auth!(%{username: username, password: password})
+       when is_binary(username) and username != "" and is_binary(password),
+       do: :ok
+
+  defp validate_auth!(config) do
+    raise ArgumentError,
+          ":username requires a non-empty username and string :password, got: " <>
+            "#{inspect(config.username)} / #{inspect(config.password)}"
+  end
+
+  defp validate_tls!(%{tls_port: nil} = config) do
+    tls_options = [
+      config.tls_cert_file,
+      config.tls_key_file,
+      config.tls_ca_cert_file,
+      config.tls_ca_cert_dir,
+      config.tls_auth_clients,
+      config.tls_client_cert_file,
+      config.tls_client_key_file,
+      config.tls_server_name
+    ]
+
+    if config.tls_insecure or config.tls_replication or config.tls_cluster or
+         Enum.any?(tls_options, &is_binary/1) do
+      raise ArgumentError, "TLS options require :tls_port"
+    end
+  end
+
+  defp validate_tls!(config) do
+    validate_tls_server_identity!(config)
+    validate_tls_ca!(config)
+    validate_tls_auth_clients!(config)
+    validate_tls_client_identity!(config)
+    _connection = connection(config)
+    :ok
+  end
+
+  defp validate_tls_server_identity!(config) do
+    required = [
+      tls_cert_file: config.tls_cert_file,
+      tls_key_file: config.tls_key_file
+    ]
+
+    case Enum.find(required, fn {_key, value} -> not (is_binary(value) and value != "") end) do
+      {key, _value} -> raise ArgumentError, ":#{key} is required when :tls_port is set"
+      nil -> :ok
+    end
+  end
+
+  defp validate_tls_ca!(config) do
+    if is_nil(config.tls_ca_cert_file) and is_nil(config.tls_ca_cert_dir) do
+      raise ArgumentError,
+            ":tls_ca_cert_file or :tls_ca_cert_dir is required when :tls_port is set"
+    end
+
+    if config.tls_ca_cert_file && config.tls_ca_cert_dir do
+      raise ArgumentError, "set only one of :tls_ca_cert_file and :tls_ca_cert_dir"
+    end
+  end
+
+  defp validate_tls_auth_clients!(config) do
+    if config.tls_auth_clients not in [nil, "yes", "no", "optional"] do
+      raise ArgumentError, ":tls_auth_clients must be \"yes\", \"no\", \"optional\", or nil"
+    end
+  end
+
+  defp validate_tls_client_identity!(config) do
+    if config.tls_auth_clients in [nil, "yes"] and
+         (is_nil(config.tls_client_cert_file) or is_nil(config.tls_client_key_file)) do
+      raise ArgumentError,
+            "Redis requires TLS client certificates by default; set " <>
+              ":tls_client_cert_file and :tls_client_key_file, or set " <>
+              ":tls_auth_clients to \"no\" or \"optional\""
+    end
+  end
+
+  defp validate_endpoint!(config) do
+    unless config.port > 0 or not is_nil(config.tls_port) or not is_nil(config.unixsocket) do
+      raise ArgumentError, "at least one of :port, :tls_port, or :unixsocket must be enabled"
+    end
+  end
+
+  # sockaddr_un.sun_path is 104 bytes on macOS and 108 on Linux. Keep one byte
+  # for the terminator and enforce the portable lower bound before Redis starts.
+  defp validate_unix_socket!(nil), do: :ok
+
+  defp validate_unix_socket!(path) when byte_size(path) <= 103, do: :ok
+
+  defp validate_unix_socket!(path) do
+    raise ArgumentError,
+          ":unixsocket must be at most 103 bytes for portable Unix-socket support, got: " <>
+            "#{byte_size(path)}"
+  end
+
+  defp validate_replication_auth!(%{replicaof: nil, masteruser: nil, masterauth: nil}), do: :ok
+
+  defp validate_replication_auth!(%{replicaof: nil}) do
+    raise ArgumentError, ":masteruser and :masterauth require :replicaof"
+  end
+
+  defp validate_replication_auth!(%{masteruser: nil}), do: :ok
+
+  defp validate_replication_auth!(%{masterauth: masterauth}) when is_binary(masterauth), do: :ok
+
+  defp validate_replication_auth!(_config) do
+    raise ArgumentError, ":masteruser requires :masterauth"
   end
 
   defp validate_save!(:default), do: :ok
@@ -529,4 +735,7 @@ defmodule RedisServerWrapper.Config do
 
   defp yn(true), do: "yes"
   defp yn(false), do: "no"
+
+  defp emit_if_true(acc, _key, false), do: acc
+  defp emit_if_true(acc, key, true), do: emit(acc, key, "yes")
 end

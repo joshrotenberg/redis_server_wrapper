@@ -1,7 +1,7 @@
 defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, OSProcess, SecureFile, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, Connection, OSProcess, SecureFile, Sentinel, Server}
 
   setup do
     fixture_dir =
@@ -80,7 +80,7 @@ defmodule RedisServerWrapperUnitTest do
   end
 
   test "CLI runs commands, assembles connection options, and raises on errors", %{cli_bin: bin} do
-    assert %Cli{host: "127.0.0.1", port: 6379} = Cli.new()
+    assert %Cli{connection: %Connection{host: "127.0.0.1", port: 6379}} = Cli.new()
 
     cli = Cli.new(bin: bin, host: "ready", port: 6380, password: "secret", tls: true)
 
@@ -97,10 +97,68 @@ defmodule RedisServerWrapperUnitTest do
 
     assert Cli.run!(cli, ["ECHO"]) =~ "--tls ECHO"
     assert Cli.ping(cli)
+    assert :ok = Cli.shutdown(cli)
 
     assert {:error, "failure"} = Cli.run(cli, ["FAIL"])
     assert_raise RuntimeError, ~r/redis-cli error: failure/, fn -> Cli.run!(cli, ["FAIL"]) end
-    refute Cli.ping(%{cli | host: "error"})
+
+    error_cli = %{cli | connection: %{cli.connection | host: "error"}}
+    refute Cli.ping(error_cli)
+  end
+
+  test "Connection assembles Unix, ACL, and complete TLS client arguments" do
+    unix =
+      Connection.new(
+        transport: :unix,
+        socket: "/tmp/redis wrapper.sock",
+        username: "app user",
+        password: "secret"
+      )
+
+    assert Connection.cli_args(unix) ==
+             ["-s", "/tmp/redis wrapper.sock", "--user", "app user"]
+
+    assert Connection.cli_env(unix) == [{"REDISCLI_AUTH", "secret"}]
+    assert Connection.url(unix) == "unix:///tmp/redis%20wrapper.sock"
+
+    tls =
+      Connection.new(
+        transport: :tls,
+        host: "::1",
+        port: 6380,
+        username: "app",
+        password: "secret",
+        tls_ca_cert_file: "/certs/ca.pem",
+        tls_client_cert_file: "/certs/client.pem",
+        tls_client_key_file: "/certs/client.key",
+        tls_server_name: "redis.test",
+        tls_insecure: true
+      )
+
+    assert Connection.cli_args(tls) == [
+             "-h",
+             "::1",
+             "-p",
+             "6380",
+             "--user",
+             "app",
+             "--tls",
+             "--cacert",
+             "/certs/ca.pem",
+             "--cert",
+             "/certs/client.pem",
+             "--key",
+             "/certs/client.key",
+             "--sni",
+             "redis.test",
+             "--insecure"
+           ]
+
+    assert Connection.url(tls) == "rediss://app:secret@[::1]:6380"
+
+    assert_raise ArgumentError, ~r/must be set together/, fn ->
+      Connection.new(transport: :tls, tls_client_cert_file: "/certs/client.pem")
+    end
   end
 
   test "CLI readiness distinguishes ready, transient, failed, and unexpected peers", %{
@@ -214,6 +272,14 @@ defmodule RedisServerWrapperUnitTest do
     assert {:error, {:invalid_distribution, :unknown}} =
              Server.start(distribution: :unknown)
 
+    assert {:error, {:invalid_config, endpoint_error}} = Server.start(port: 0)
+    assert endpoint_error =~ "at least one of :port, :tls_port, or :unixsocket"
+
+    assert {:error, {:invalid_config, tls_error}} =
+             Server.start(port: 0, tls_port: 6442)
+
+    assert tls_error =~ ":tls_cert_file is required"
+
     assert {:error, {:server_start_failed, 6440, _status, _output}} =
              Server.start(port: 6440, managed: false, redis_server_bin: "false")
 
@@ -305,6 +371,7 @@ defmodule RedisServerWrapperUnitTest do
     assert OSProcess.orphaned?(123)
     refute OSProcess.orphaned?(999)
     assert {:ok, [123, 456]} = OSProcess.pids_on_port(6490)
+    assert {:ok, [123, 456]} = OSProcess.pids_on_socket("/tmp/redis.sock")
   end
 
   test "missing kill and lsof do not crash process helpers or normal teardown", %{
@@ -325,6 +392,10 @@ defmodule RedisServerWrapperUnitTest do
     refute OSProcess.available?("lsof")
     assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(1, :term)
     assert {:error, {:executable_not_found, "lsof"}} = OSProcess.pids_on_port(6490)
+
+    assert {:error, {:executable_not_found, "lsof"}} =
+             OSProcess.pids_on_socket("/tmp/redis.sock")
+
     assert is_boolean(OSProcess.alive?(String.to_integer(System.pid())))
     assert is_boolean(OSProcess.orphaned?(String.to_integer(System.pid())))
 
@@ -359,6 +430,12 @@ defmodule RedisServerWrapperUnitTest do
     assert {:error, {:invalid_option, :timeout, 0}} = Cluster.start(timeout: 0)
     assert {:error, {:invalid_option, :base_port, 0}} = Cluster.start(base_port: 0)
 
+    assert {:error, {:unsupported_transport, :cluster, :unix}} =
+             Cluster.start(unixsocket: "/tmp/cluster.sock")
+
+    assert {:error, {:invalid_connection_config, tls_error}} = Cluster.start(tls: true)
+    assert tls_error =~ ":tls_cert_file is required"
+
     assert {:error, {:invalid_port_range, :cluster_nodes, 65_535, 65_536}} =
              Cluster.start(masters: 2, base_port: 65_535)
 
@@ -379,6 +456,12 @@ defmodule RedisServerWrapperUnitTest do
     assert {:error, {:invalid_quorum, 4, 3}} = Sentinel.start(quorum: 4)
     assert {:error, {:invalid_option, :timeout, 0}} = Sentinel.start(timeout: 0)
     assert {:error, {:invalid_option, :master_port, "bad"}} = Sentinel.start(master_port: "bad")
+
+    assert {:error, {:unsupported_transport, :sentinel, :unix}} =
+             Sentinel.start(unixsocket: "/tmp/sentinel.sock")
+
+    assert {:error, {:invalid_connection_config, tls_error}} = Sentinel.start(tls: true)
+    assert tls_error =~ ":tls_cert_file is required"
 
     assert {:error, {:invalid_option, :sentinel_base_port, 0}} =
              Sentinel.start(sentinel_base_port: 0)

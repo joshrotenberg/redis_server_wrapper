@@ -18,6 +18,15 @@ defmodule RedisServerWrapper.Server do
 
     * `:redis_server_bin` - path to redis-server binary (default: "redis-server")
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
+    * `:username` - optional named ACL user paired with `:password`
+    * `:port` - plaintext TCP port; use `0` to disable plaintext TCP
+    * `:unixsocket` - Unix socket path used when TCP and TLS are disabled
+    * `:tls_port` - TLS listener and lifecycle connection port
+    * `:tls_cert_file`, `:tls_key_file` - Redis TLS server identity
+    * `:tls_ca_cert_file` or `:tls_ca_cert_dir` - trusted CA for Redis and redis-cli
+    * `:tls_client_cert_file`, `:tls_client_key_file` - optional redis-cli identity
+    * `:tls_server_name` - optional redis-cli SNI name
+    * `:tls_insecure` - explicitly disable redis-cli certificate verification
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`.
       Only explicit `:legacy_stack` selection enables legacy Stack module
       discovery; caller-provided `:loadmodule` entries always remain explicit.
@@ -41,7 +50,7 @@ defmodule RedisServerWrapper.Server do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, OSProcess, SecureFile}
+  alias RedisServerWrapper.{Cli, Config, Connection, OSProcess, SecureFile}
 
   require Logger
 
@@ -114,7 +123,7 @@ defmodule RedisServerWrapper.Server do
   @spec run(GenServer.server(), [String.t()]) :: {:ok, String.t()} | {:error, String.t()}
   def run(server, args), do: GenServer.call(server, {:run, args})
 
-  @doc "Returns connection info: host, port, password, pid, node_dir."
+  @doc "Returns connection and process information."
   @spec info(GenServer.server()) :: map()
   def info(server), do: GenServer.call(server, :info)
 
@@ -168,26 +177,26 @@ defmodule RedisServerWrapper.Server do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     managed = Keyword.get(opts, :managed, true)
 
+    config_opts =
+      Keyword.drop(opts, [
+        :redis_server_bin,
+        :redis_cli_bin,
+        :distribution,
+        :name,
+        :timeout,
+        :managed
+      ])
+
     # Validate binaries and the managed backend selection
     with :ok <- validate_distribution(distribution),
          redis_server_bin =
            Keyword.get_lazy(opts, :redis_server_bin, fn -> default_server_bin(distribution) end),
          :ok <- validate_managed(managed),
          :ok <- check_binary(redis_server_bin),
-         :ok <- check_binary(redis_cli_bin) do
-      config_opts =
-        Keyword.drop(opts, [
-          :redis_server_bin,
-          :redis_cli_bin,
-          :distribution,
-          :name,
-          :timeout,
-          :managed
-        ])
-
-      config = Config.new(config_opts)
-
-      case start_redis_server(
+         :ok <- check_binary(redis_cli_bin),
+         {:ok, config} <- build_config(config_opts),
+         {:ok, state} <-
+           start_redis_server(
              config,
              redis_server_bin,
              redis_cli_bin,
@@ -195,12 +204,7 @@ defmodule RedisServerWrapper.Server do
              managed,
              distribution
            ) do
-        {:ok, state} ->
-          {:ok, state}
-
-        {:error, reason} ->
-          {:stop, reason}
-      end
+      {:ok, state}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -220,11 +224,17 @@ defmodule RedisServerWrapper.Server do
   end
 
   def handle_call(:info, _from, state) do
+    connection = state.cli.connection
+
     info = %{
       host: Config.control_host(state.config),
       bind: state.config.bind,
       port: state.config.port,
+      tls_port: state.config.tls_port,
+      unixsocket: state.config.unixsocket,
+      username: state.config.username,
       password: state.config.password,
+      connection: connection,
       pid: state.pid,
       node_dir: state.node_dir,
       distribution: state.distribution,
@@ -290,7 +300,8 @@ defmodule RedisServerWrapper.Server do
     # until the whole redis-server process group is confirmed dead (SIGTERM then
     # SIGKILL). No SHUTDOWN/Port.close/SIGKILL ladder needed on this path.
     Logger.debug(
-      "RedisServerWrapper.Server terminating, stopping Forcola.Daemon for port #{state.config.port}"
+      "RedisServerWrapper.Server terminating, stopping Forcola.Daemon for " <>
+        Connection.label(state.cli.connection)
     )
 
     stop_daemon(daemon)
@@ -299,7 +310,8 @@ defmodule RedisServerWrapper.Server do
 
   def terminate(_reason, state) do
     Logger.debug(
-      "RedisServerWrapper.Server terminating, sending SHUTDOWN NOSAVE to port #{state.config.port}"
+      "RedisServerWrapper.Server terminating, sending SHUTDOWN NOSAVE to " <>
+        Connection.label(state.cli.connection)
     )
 
     shutdown_if_owned(state)
@@ -315,9 +327,14 @@ defmodule RedisServerWrapper.Server do
 
     force_kill_pid =
       cond do
-        managed_pid_owned -> state.pid
-        is_nil(state.port_ref) and pid_owns_port?(state.pid, state.config.port) -> state.pid
-        true -> nil
+        managed_pid_owned ->
+          state.pid
+
+        is_nil(state.port_ref) and pid_owns_listener?(state.pid, state.cli.connection) ->
+          state.pid
+
+        true ->
+          nil
       end
 
     # Force kill only when ownership was re-established immediately before the
@@ -365,13 +382,14 @@ defmodule RedisServerWrapper.Server do
 
   # Port-based: redis-server runs in the foreground, tied to the BEAM.
   defp start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
-    with :ok <- check_port_available(Config.control_host(config), config.port) do
+    with :ok <- check_endpoints_available(config) do
       do_start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution)
     end
   end
 
   defp do_start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
-    node_dir = make_node_dir(config.port)
+    connection = Config.connection(config)
+    node_dir = make_node_dir(Connection.id(connection))
 
     config = %{
       config
@@ -400,9 +418,7 @@ defmodule RedisServerWrapper.Server do
     cli =
       Cli.new(
         bin: redis_cli_bin,
-        host: Config.control_host(config),
-        port: config.port,
-        password: config.password
+        connection: Config.connection(config)
       )
 
     case Cli.wait_for_ready(cli, timeout) do
@@ -428,11 +444,11 @@ defmodule RedisServerWrapper.Server do
 
       {:error, :timeout} ->
         safe_port_close(port_ref)
-        {:error, {:server_start_timeout, config.port}}
+        {:error, server_start_timeout(cli.connection)}
 
       {:error, {:unexpected_reply, reply}} ->
         safe_port_close(port_ref)
-        {:error, {:port_in_use, config.port, reply}}
+        {:error, endpoint_in_use(cli.connection, reply)}
     end
   end
 
@@ -449,7 +465,7 @@ defmodule RedisServerWrapper.Server do
          distribution
        ) do
     if forcola_available?() do
-      with :ok <- check_port_available(Config.control_host(config), config.port) do
+      with :ok <- check_endpoints_available(config) do
         do_start_managed_forcola(
           config,
           redis_server_bin,
@@ -470,7 +486,8 @@ defmodule RedisServerWrapper.Server do
          timeout,
          distribution
        ) do
-    node_dir = make_node_dir(config.port)
+    connection = Config.connection(config)
+    node_dir = make_node_dir(Connection.id(connection))
 
     config = %{
       config
@@ -491,9 +508,7 @@ defmodule RedisServerWrapper.Server do
     cli =
       Cli.new(
         bin: redis_cli_bin,
-        host: Config.control_host(config),
-        port: config.port,
-        password: config.password
+        connection: Config.connection(config)
       )
 
     daemon_opts = [
@@ -521,10 +536,10 @@ defmodule RedisServerWrapper.Server do
         {:ok, state}
 
       {:error, :ready_timeout} ->
-        {:error, {:server_start_timeout, config.port}}
+        {:error, server_start_timeout(cli.connection)}
 
       {:error, {:exited_before_ready, reason}} ->
-        {:error, {:server_start_failed, config.port, reason}}
+        {:error, {:server_start_failed, endpoint_value(cli.connection), reason}}
 
       {:error, reason} ->
         {:error, reason}
@@ -544,13 +559,14 @@ defmodule RedisServerWrapper.Server do
   # wanted instances. If the port is held, check_port_available returns
   # {:error, {:port_in_use, ...}} and the caller decides what to do.
   defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
-    with :ok <- check_port_available(Config.control_host(config), config.port) do
+    with :ok <- check_endpoints_available(config) do
       do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution)
     end
   end
 
   defp do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
-    node_dir = make_node_dir(config.port)
+    connection = Config.connection(config)
+    node_dir = make_node_dir(Connection.id(connection))
     pidfile_path = Path.join(node_dir, "redis.pid")
 
     config = %{
@@ -574,9 +590,7 @@ defmodule RedisServerWrapper.Server do
         cli =
           Cli.new(
             bin: redis_cli_bin,
-            host: Config.control_host(config),
-            port: config.port,
-            password: config.password
+            connection: Config.connection(config)
           )
 
         case Cli.wait_for_ready(cli, timeout) do
@@ -596,16 +610,47 @@ defmodule RedisServerWrapper.Server do
             {:ok, state}
 
           {:error, :timeout} ->
-            {:error, {:server_start_timeout, config.port}}
+            {:error, server_start_timeout(cli.connection)}
 
           {:error, {:unexpected_reply, reply}} ->
-            {:error, {:port_in_use, config.port, reply}}
+            {:error, endpoint_in_use(cli.connection, reply)}
         end
 
       {output, code} ->
-        {:error, {:server_start_failed, config.port, code, output}}
+        {:error, {:server_start_failed, endpoint_value(connection), code, output}}
     end
   end
+
+  defp check_endpoints_available(config) do
+    endpoints =
+      []
+      |> maybe_add_tcp_endpoint(Config.control_host(config), config.port)
+      |> maybe_add_tcp_endpoint(Config.control_host(config), config.tls_port)
+      |> maybe_add_unix_endpoint(config.unixsocket)
+      |> Enum.uniq()
+
+    Enum.reduce_while(endpoints, :ok, fn
+      {:tcp, host, port}, :ok ->
+        case check_port_available(host, port) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      {:unix, path}, :ok ->
+        if File.exists?(path) do
+          {:halt, {:error, {:unix_socket_in_use, path}}}
+        else
+          {:cont, :ok}
+        end
+    end)
+  end
+
+  defp maybe_add_tcp_endpoint(endpoints, _host, nil), do: endpoints
+  defp maybe_add_tcp_endpoint(endpoints, _host, 0), do: endpoints
+  defp maybe_add_tcp_endpoint(endpoints, host, port), do: [{:tcp, host, port} | endpoints]
+
+  defp maybe_add_unix_endpoint(endpoints, nil), do: endpoints
+  defp maybe_add_unix_endpoint(endpoints, path), do: [{:unix, path} | endpoints]
 
   # Pre-flight: try to bind the target (bind, port) ourselves to detect the
   # common case where another process (another redis-server, macOS AirPlay,
@@ -640,12 +685,12 @@ defmodule RedisServerWrapper.Server do
     end
   end
 
-  defp make_node_dir(port) do
+  defp make_node_dir(endpoint_id) do
     dir =
       Path.join([
         System.tmp_dir!(),
         "redis-server-wrapper",
-        "node-#{port}"
+        "node-#{endpoint_id}"
       ])
 
     File.rm_rf!(dir)
@@ -686,7 +731,7 @@ defmodule RedisServerWrapper.Server do
     if managed_port_owns_pid?(state.port_ref, state.pid) do
       run_shutdown(state)
     else
-      shutdown_if_listener_owned(state, OSProcess.pids_on_port(state.config.port))
+      shutdown_if_listener_owned(state, pids_on_listener(state.cli.connection))
     end
   end
 
@@ -695,7 +740,7 @@ defmodule RedisServerWrapper.Server do
       run_shutdown(state)
     else
       Logger.warning(
-        "Skipping Redis shutdown on port #{state.config.port}: " <>
+        "Skipping Redis shutdown on #{Connection.label(state.cli.connection)}: " <>
           "tracked PID #{state.pid} no longer owns the listener"
       )
     end
@@ -704,7 +749,7 @@ defmodule RedisServerWrapper.Server do
   defp shutdown_if_listener_owned(state, {:error, {:executable_not_found, "lsof"}}) do
     Logger.warning(
       "lsof is unavailable; skipping ownership-sensitive Redis shutdown " <>
-        "on port #{state.config.port}"
+        "on #{Connection.label(state.cli.connection)}"
     )
   end
 
@@ -722,14 +767,35 @@ defmodule RedisServerWrapper.Server do
 
   defp managed_port_owns_pid?(_port_ref, _pid), do: false
 
-  defp pid_owns_port?(pid, port) when is_integer(pid) do
-    case OSProcess.pids_on_port(port) do
+  defp pid_owns_listener?(pid, connection) when is_integer(pid) do
+    case pids_on_listener(connection) do
       {:ok, pids} -> pid in pids
       {:error, _reason} -> false
     end
   end
 
-  defp pid_owns_port?(_pid, _port), do: false
+  defp pid_owns_listener?(_pid, _connection), do: false
+
+  defp pids_on_listener(%Connection{transport: :unix, socket: socket}) do
+    OSProcess.pids_on_socket(socket)
+  end
+
+  defp pids_on_listener(%Connection{port: port}), do: OSProcess.pids_on_port(port)
+
+  defp server_start_timeout(%Connection{transport: :unix, socket: socket}) do
+    {:server_start_timeout, {:unix, socket}}
+  end
+
+  defp server_start_timeout(%Connection{port: port}), do: {:server_start_timeout, port}
+
+  defp endpoint_in_use(%Connection{transport: :unix, socket: socket}, reply) do
+    {:unix_socket_in_use, socket, reply}
+  end
+
+  defp endpoint_in_use(%Connection{port: port}, reply), do: {:port_in_use, port, reply}
+
+  defp endpoint_value(%Connection{transport: :unix, socket: socket}), do: {:unix, socket}
+  defp endpoint_value(%Connection{port: port}), do: port
 
   defp warn_if_signal_unavailable(
          {:error, {:executable_not_found, "kill"}},
@@ -777,6 +843,12 @@ defmodule RedisServerWrapper.Server do
       nil -> {:error, {:binary_not_found, bin}}
       _path -> :ok
     end
+  end
+
+  defp build_config(opts) do
+    {:ok, Config.new(opts)}
+  rescue
+    error in ArgumentError -> {:error, {:invalid_config, Exception.message(error)}}
   end
 
   defp extract_gen_opts(opts) do

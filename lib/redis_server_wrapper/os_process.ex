@@ -81,6 +81,29 @@ defmodule RedisServerWrapper.OSProcess do
     end
   end
 
+  @spec pids_on_socket(String.t()) ::
+          {:ok, [pos_integer()]} | {:error, {:executable_not_found, String.t()}}
+  def pids_on_socket(path) when is_binary(path) and path != "" do
+    case System.find_executable("lsof") do
+      nil ->
+        {:error, {:executable_not_found, "lsof"}}
+
+      lsof ->
+        case System.cmd(lsof, ["-t", "--", path], stderr_to_stdout: true) do
+          {output, 0} ->
+            pids =
+              output
+              |> String.split(~r/\s+/, trim: true)
+              |> Enum.flat_map(&parse_pid/1)
+
+            {:ok, pids}
+
+          _other ->
+            {:ok, []}
+        end
+    end
+  end
+
   defp signal_arg(:term), do: "-TERM"
   defp signal_arg(:kill), do: "-9"
   defp signal_arg(:stop), do: "-STOP"

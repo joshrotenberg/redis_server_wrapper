@@ -259,6 +259,73 @@ RedisServerWrapper.start_server(
 )
 ```
 
+### TCP, TLS, Unix sockets, and ACL authentication
+
+Lifecycle operations use a shared `RedisServerWrapper.Connection`, so startup
+readiness, commands, health checks, shutdown, Cluster, Sentinel, and Manager
+all retain the same endpoint and credentials.
+
+Set `username` with `password` to configure and use a named ACL user. Without a
+username, `password` retains its password-only `requirepass` behavior:
+
+```elixir
+RedisServerWrapper.start_server(
+  port: 6400,
+  username: "demo-app",
+  password: "secret"
+)
+```
+
+Disable TCP with `port: 0` for a Unix-only server:
+
+```elixir
+RedisServerWrapper.start_server(
+  port: 0,
+  unixsocket: "/tmp/demo-redis.sock",
+  unixsocketperm: "700"
+)
+```
+
+For a TLS-only server, set `port: 0`, a `tls_port`, and the server identity.
+The CA file or directory is also used by `redis-cli` for verification:
+
+```elixir
+RedisServerWrapper.start_server(
+  port: 0,
+  tls_port: 6400,
+  tls_cert_file: "/certs/server.crt",
+  tls_key_file: "/certs/server.key",
+  tls_ca_cert_file: "/certs/ca.crt",
+  tls_auth_clients: "no",
+  tls_server_name: "redis.demo.test"
+)
+```
+
+Use `tls_ca_cert_dir` instead of `tls_ca_cert_file` for a CA directory.
+Mutual-TLS clients can set `tls_client_cert_file` and
+`tls_client_key_file`. `tls_insecure: true` explicitly disables redis-cli
+certificate verification and is intended only for controlled tests.
+
+Cluster and Sentinel use TLS-only nodes when `tls: true`; pass the same
+certificate options:
+
+```elixir
+RedisServerWrapper.start_cluster(
+  masters: 3,
+  base_port: 7100,
+  tls: true,
+  tls_cert_file: "/certs/server.crt",
+  tls_key_file: "/certs/server.key",
+  tls_ca_cert_file: "/certs/ca.crt",
+  tls_auth_clients: "no"
+)
+```
+
+The wrapper enables `tls-cluster` or `tls-replication` as required. Sentinel
+also configures `sentinel auth-user`/`auth-pass` for named ACL credentials.
+Unix sockets are a standalone-server transport; Cluster and Sentinel reject
+them immediately because their nodes must communicate over network ports.
+
 ### Chaos / Fault Injection
 
 The `Chaos` module provides fault injection primitives for testing resilience:
