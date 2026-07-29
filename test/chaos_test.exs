@@ -3,7 +3,7 @@ defmodule RedisServerWrapper.ChaosTest do
 
   alias RedisServerWrapper.{Chaos, Cli, Cluster, Server}
 
-  defp wait_until(fun, retries \\ 10, delay \\ 1000) do
+  defp wait_until(fun, retries, delay) do
     if fun.() do
       true
     else
@@ -153,7 +153,7 @@ defmodule RedisServerWrapper.ChaosTest do
     @tag timeout: 30_000
     test "kills the master owning a key's slot" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7300)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       assert {:ok, "OK"} = Cluster.run(cluster, ["-c", "SET", "testkey", "value"])
 
@@ -170,7 +170,7 @@ defmodule RedisServerWrapper.ChaosTest do
     @tag timeout: 30_000
     test "kills the master owning a specific slot" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7310)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       {:ok, killed_pid} = Chaos.kill_master(cluster, 0)
       assert is_pid(killed_pid)
@@ -187,7 +187,7 @@ defmodule RedisServerWrapper.ChaosTest do
     @tag timeout: 60_000
     test "freezes nodes in non-active groups" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7320)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       nodes = Cluster.nodes(cluster)
       {active, frozen} = Enum.split(nodes, 1)
@@ -230,7 +230,7 @@ defmodule RedisServerWrapper.ChaosTest do
     @tag timeout: 30_000
     test "kills a random cluster node" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7330)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       {:ok, killed_pid} = Chaos.random_kill(cluster)
       assert is_pid(killed_pid)
@@ -249,7 +249,7 @@ defmodule RedisServerWrapper.ChaosTest do
       {:ok, cluster} =
         Cluster.start_link(masters: 3, replicas_per_master: 1, base_port: 7350)
 
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       # Kill the master for slot 0
       {:ok, killed} = Chaos.kill_master(cluster, 0)
@@ -289,7 +289,7 @@ defmodule RedisServerWrapper.ChaosTest do
       {:ok, cluster} =
         Cluster.start_link(masters: 3, replicas_per_master: 1, base_port: 7360)
 
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       # Find any replica node
       nodes = Cluster.nodes(cluster)
@@ -321,7 +321,7 @@ defmodule RedisServerWrapper.ChaosTest do
     @tag timeout: 60_000
     test "resumes all frozen nodes in a cluster" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7340)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end, 10, 500)
 
       # Get ports before freezing
       ports =

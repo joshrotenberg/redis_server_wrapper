@@ -15,7 +15,7 @@ Add `redis_server_wrapper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:redis_server_wrapper, "~> 0.1.0"}
+    {:redis_server_wrapper, "~> 0.7"}
   ]
 end
 ```
@@ -129,6 +129,52 @@ RedisServerWrapper.Manager.stop("dev-redis")
   SHA256-verified shim binaries, so it needs no Rust toolchain at build time.
 - `managed: false` - `redis-server` daemonizes independently; the caller owns the
   OS process lifecycle.
+
+### Custom Modules
+
+Use `:loadmodule` to load one or more Redis modules. A plain path is enough for
+a module with defaults; use `{path, [args]}` when it takes load-time arguments.
+The structured form quotes every path and argument safely in the generated
+`redis.conf`.
+
+```elixir
+module_path = System.fetch_env!("EVENT_STREAM_MODULE")
+
+{:ok, server} =
+  RedisServerWrapper.start_server(
+    port: 6460,
+    loadmodule: [
+      {module_path, ["events", "expired,set", "maxlen", "1000"]}
+    ]
+  )
+
+RedisServerWrapper.Server.run(server, ["MODULE", "LIST"])
+```
+
+For a cluster, the same modules are loaded into every node. For a Sentinel
+topology, they are loaded into the master and every replica (not the Sentinel
+control processes):
+
+```elixir
+RedisServerWrapper.start_cluster(
+  base_port: 7100,
+  loadmodule: [
+    {module_path, ["cluster-streams", "per-node"]}
+  ]
+)
+```
+
+The original raw directive form remains supported for compatibility, such as
+`loadmodule: ["/path/module.so events expired"]`, but the structured form is
+recommended when arguments are present.
+
+For a complete event-stream demo using
+[`redis-event-stream-module`](https://github.com/joshrotenberg/redis-event-stream-module):
+
+```bash
+EVENT_STREAM_MODULE=/absolute/path/to/libredis_event_stream_module.so \
+  mix run examples/event_stream.exs
+```
 
 ## Configuration
 

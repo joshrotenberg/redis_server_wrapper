@@ -20,6 +20,8 @@ defmodule RedisServerWrapper.Server do
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
     * `:name` - GenServer name registration
     * `:timeout` - startup timeout in ms (default: 10_000)
+    * `:loadmodule` - Redis modules to load; accepts module paths or
+      `{path, [args]}` tuples (default: `[]`)
     * `:managed` - controls how the redis-server OS process is tied to the BEAM:
       * `true` (default) - redis-server runs as a Port tied to the BEAM lifecycle.
         When the BEAM exits, the port closes and redis-server receives SIGHUP.
@@ -121,7 +123,6 @@ defmodule RedisServerWrapper.Server do
   @spec stop(GenServer.server()) :: :ok
   def stop(server), do: GenServer.stop(server, :normal)
 
-  @spec default_server_bin() :: String.t()
   @doc """
   Returns the default redis-server binary path.
   Prefers the actual redis-server binary from redis-stack (includes modules)
