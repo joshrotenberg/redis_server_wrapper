@@ -223,10 +223,11 @@ defmodule RedisServerWrapper.Server do
     {:reply, state.cli, state}
   end
 
-  def handle_call(:detach, _from, %{managed: true} = state) do
+  def handle_call(:detach, _from, %{managed: managed} = state)
+      when managed in [true, :forcola] do
     Logger.warning(
-      "Detaching a managed (Port-based) server is not supported; " <>
-        "the OS process is tied to the BEAM lifecycle. Use managed: false to enable detach."
+      "Detaching a managed server is not supported; the OS process is tied to " <>
+        "the BEAM lifecycle. Use managed: false to enable detach."
     )
 
     {:reply, {:error, :managed_server}, state}

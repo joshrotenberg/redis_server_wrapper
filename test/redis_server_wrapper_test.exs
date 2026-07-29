@@ -252,6 +252,15 @@ defmodule RedisServerWrapperTest do
       assert lsof_port(6421) == []
     end
 
+    test "forcola server cannot detach from the BEAM lifecycle" do
+      {:ok, server} = Server.start_link(port: 6423, managed: :forcola)
+
+      assert {:error, :managed_server} = Server.detach(server)
+      refute Server.info(server).detached
+
+      Server.stop(server)
+    end
+
     # The core guarantee: terminate/2 does NOT run on a :brutal_kill, but the
     # forcola shim still kills the redis-server process group on owner death,
     # so the port is released. This is the leak the Port path cannot close.
@@ -267,7 +276,7 @@ defmodule RedisServerWrapperTest do
     end
 
     test "invalid managed value yields a clear error" do
-      assert {:error, {:invalid_managed, :bogus}} = Server.start(port: 6423, managed: :bogus)
+      assert {:error, {:invalid_managed, :bogus}} = Server.start(port: 6424, managed: :bogus)
     end
   end
 
