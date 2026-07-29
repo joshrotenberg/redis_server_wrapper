@@ -100,6 +100,36 @@ RedisServerWrapper.Manager.list()
 RedisServerWrapper.Manager.stop("dev-redis")
 ```
 
+### Managed Process Lifecycle
+
+`Server.start_link/1` accepts a `:managed` option controlling how the
+`redis-server` OS process is tied to the BEAM:
+
+- `managed: true` (default) - `redis-server` runs as a foreground Port. Teardown
+  runs in `terminate/2`, which OTP skips on a `:brutal_kill` supervisor shutdown
+  or a hard BEAM death (SIGKILL, OOM), so the OS process can be stranded on those
+  paths, keeping its port bound.
+- `managed: :forcola` - `redis-server` runs in the foreground under a
+  [`Forcola.Daemon`](https://github.com/joshrotenberg/forcola), whose Rust shim
+  guarantees the OS process group is killed and confirmed dead on owner death or
+  supervisor shutdown, including the paths where `terminate/2` never runs. This
+  requires the optional dependency and is opt-in:
+
+  ```elixir
+  # mix.exs
+  {:forcola, "~> 0.3"}
+  ```
+
+  ```elixir
+  {:ok, server} = RedisServerWrapper.Server.start_link(port: 6400, managed: :forcola)
+  ```
+
+  Without `:forcola` on the path, `start_link` returns
+  `{:error, :forcola_not_available}`. Forcola is POSIX-only and ships precompiled,
+  SHA256-verified shim binaries, so it needs no Rust toolchain at build time.
+- `managed: false` - `redis-server` daemonizes independently; the caller owns the
+  OS process lifecycle.
+
 ## Configuration
 
 All Redis configuration directives can be set via the `Config` struct options.
