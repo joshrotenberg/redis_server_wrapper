@@ -57,15 +57,16 @@ defmodule RedisServerWrapper do
   Checks if `redis-server` is available on PATH (or at the given path).
   """
   @spec available?(String.t()) :: boolean()
-  def available?(bin \\ "redis-server") do
+  def available?(bin \\ Server.default_server_bin()) do
     System.find_executable(bin) != nil
   end
 
   @doc """
-  Returns the version of redis-server on PATH, or `{:error, reason}`.
+  Returns the version of the same core redis-server binary selected by default
+  startup, or of an explicitly supplied binary.
   """
   @spec version(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def version(bin \\ "redis-server") do
+  def version(bin \\ Server.default_server_bin()) do
     with path when not is_nil(path) <- System.find_executable(bin),
          {output, 0} <- System.cmd(path, ["--version"], stderr_to_stdout: true) do
       case Regex.run(~r/v=(\S+)/, output) do

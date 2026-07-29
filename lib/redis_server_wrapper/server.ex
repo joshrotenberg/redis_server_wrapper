@@ -18,6 +18,9 @@ defmodule RedisServerWrapper.Server do
 
     * `:redis_server_bin` - path to redis-server binary (default: "redis-server")
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`.
+      Only explicit `:legacy_stack` selection enables legacy Stack module
+      discovery; caller-provided `:loadmodule` entries always remain explicit.
     * `:name` - GenServer name registration
     * `:timeout` - startup timeout in ms (default: 10_000)
     * `:loadmodule` - Redis modules to load; accepts module paths or
@@ -46,6 +49,7 @@ defmodule RedisServerWrapper.Server do
   @compile {:no_warn_undefined, Forcola.Daemon}
 
   @default_timeout 10_000
+  @legacy_stack_server_env "REDIS_LEGACY_STACK_SERVER_BIN"
 
   defstruct [
     :config,
@@ -53,6 +57,7 @@ defmodule RedisServerWrapper.Server do
     :pid,
     :node_dir,
     :redis_server_bin,
+    :distribution,
     :port_ref,
     :daemon,
     managed: true,
@@ -60,6 +65,7 @@ defmodule RedisServerWrapper.Server do
   ]
 
   @type managed :: boolean() | :forcola
+  @type distribution :: :core | :full | :legacy_stack
 
   @type t :: %__MODULE__{
           config: Config.t(),
@@ -67,6 +73,7 @@ defmodule RedisServerWrapper.Server do
           pid: non_neg_integer() | nil,
           node_dir: String.t() | nil,
           redis_server_bin: String.t(),
+          distribution: distribution(),
           port_ref: port() | nil,
           daemon: pid() | nil,
           managed: managed(),
@@ -127,40 +134,26 @@ defmodule RedisServerWrapper.Server do
   def stop(server), do: GenServer.stop(server, :normal)
 
   @doc """
-  Returns the default redis-server binary path.
-  Prefers the actual redis-server binary from redis-stack (includes modules)
-  over the wrapper script, then falls back to plain redis-server.
+  Returns the default redis-server binary for a distribution.
 
-  We avoid the redis-stack-server bash wrapper because it overrides our
-  `dir` config with its own --dir flag, causing cluster config files to
-  end up in the wrong place. Instead, we use the real binary directly.
+  Core and Redis 8 Full use `redis-server` from PATH. Legacy Redis Stack is
+  opt-in and uses `REDIS_LEGACY_STACK_SERVER_BIN` when set, otherwise
+  `redis-stack-server`.
   """
-  @spec default_server_bin() :: String.t()
-  def default_server_bin do
-    # Prefer the actual binary inside the redis-stack cask (not the wrapper script)
-    stack_bin = find_stack_redis_server()
+  @spec default_server_bin(distribution()) :: String.t()
+  def default_server_bin(distribution \\ :core)
+  def default_server_bin(distribution) when distribution in [:core, :full], do: "redis-server"
 
-    cond do
-      stack_bin -> stack_bin
-      System.find_executable("redis-server") -> "redis-server"
-      true -> "redis-server"
-    end
-  end
+  def default_server_bin(:legacy_stack),
+    do: System.get_env(@legacy_stack_server_env) || "redis-stack-server"
 
-  # Find the real redis-server binary inside the redis-stack installation.
-  # The wrapper script at /opt/homebrew/bin/redis-stack-server just calls
-  # the real binary with --loadmodule flags. We want the real binary so
-  # we have full control over config (especially `dir`).
-  defp find_stack_redis_server do
-    paths = [
-      "/opt/homebrew/Caskroom/redis-stack-server/*/bin/redis-server",
-      "/usr/local/Caskroom/redis-stack-server/*/bin/redis-server"
-    ]
+  @doc false
+  @spec validate_distribution(term()) :: :ok | {:error, {:invalid_distribution, term()}}
+  def validate_distribution(distribution)
+      when distribution in [:core, :full, :legacy_stack],
+      do: :ok
 
-    paths
-    |> Enum.flat_map(&Path.wildcard/1)
-    |> List.first()
-  end
+  def validate_distribution(other), do: {:error, {:invalid_distribution, other}}
 
   # -------------------------------------------------------------------
   # GenServer callbacks
@@ -170,21 +163,38 @@ defmodule RedisServerWrapper.Server do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    redis_server_bin = Keyword.get_lazy(opts, :redis_server_bin, &default_server_bin/0)
+    distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     managed = Keyword.get(opts, :managed, true)
 
     # Validate binaries and the managed backend selection
-    with :ok <- validate_managed(managed),
+    with :ok <- validate_distribution(distribution),
+         redis_server_bin =
+           Keyword.get_lazy(opts, :redis_server_bin, fn -> default_server_bin(distribution) end),
+         :ok <- validate_managed(managed),
          :ok <- check_binary(redis_server_bin),
          :ok <- check_binary(redis_cli_bin) do
       config_opts =
-        Keyword.drop(opts, [:redis_server_bin, :redis_cli_bin, :name, :timeout, :managed])
+        Keyword.drop(opts, [
+          :redis_server_bin,
+          :redis_cli_bin,
+          :distribution,
+          :name,
+          :timeout,
+          :managed
+        ])
 
       config = Config.new(config_opts)
 
-      case start_redis_server(config, redis_server_bin, redis_cli_bin, timeout, managed) do
+      case start_redis_server(
+             config,
+             redis_server_bin,
+             redis_cli_bin,
+             timeout,
+             managed,
+             distribution
+           ) do
         {:ok, state} ->
           {:ok, state}
 
@@ -217,6 +227,7 @@ defmodule RedisServerWrapper.Server do
       password: state.config.password,
       pid: state.pid,
       node_dir: state.node_dir,
+      distribution: state.distribution,
       detached: state.detached,
       managed: state.managed
     }
@@ -326,22 +337,40 @@ defmodule RedisServerWrapper.Server do
   # Internal helpers
   # -------------------------------------------------------------------
 
-  defp start_redis_server(config, redis_server_bin, redis_cli_bin, timeout, managed) do
+  defp start_redis_server(
+         config,
+         redis_server_bin,
+         redis_cli_bin,
+         timeout,
+         managed,
+         distribution
+       ) do
     case managed do
-      :forcola -> start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
-      true -> start_managed(config, redis_server_bin, redis_cli_bin, timeout)
-      false -> start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
+      :forcola ->
+        start_managed_forcola(
+          config,
+          redis_server_bin,
+          redis_cli_bin,
+          timeout,
+          distribution
+        )
+
+      true ->
+        start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution)
+
+      false ->
+        start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution)
     end
   end
 
   # Port-based: redis-server runs in the foreground, tied to the BEAM.
-  defp start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
     with :ok <- check_port_available(Config.control_host(config), config.port) do
-      do_start_managed(config, redis_server_bin, redis_cli_bin, timeout)
+      do_start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution)
     end
   end
 
-  defp do_start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp do_start_managed(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
     node_dir = make_node_dir(config.port)
 
     config = %{
@@ -358,7 +387,7 @@ defmodule RedisServerWrapper.Server do
     server_bin_path = System.find_executable(redis_server_bin)
 
     # If using the redis-stack binary, load the Stack modules
-    module_args = detect_stack_modules(server_bin_path)
+    module_args = distribution_module_args(distribution, server_bin_path)
 
     port_ref =
       Port.open({:spawn_executable, server_bin_path}, [
@@ -390,6 +419,7 @@ defmodule RedisServerWrapper.Server do
           pid: os_pid,
           node_dir: node_dir,
           redis_server_bin: redis_server_bin,
+          distribution: distribution,
           port_ref: port_ref,
           managed: true
         }
@@ -411,17 +441,35 @@ defmodule RedisServerWrapper.Server do
   # guarantees the OS process group is killed and confirmed dead on owner death
   # or supervisor shutdown, including the :brutal_kill and hard-BEAM-death paths
   # where terminate/2 never runs.
-  defp start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_managed_forcola(
+         config,
+         redis_server_bin,
+         redis_cli_bin,
+         timeout,
+         distribution
+       ) do
     if forcola_available?() do
       with :ok <- check_port_available(Config.control_host(config), config.port) do
-        do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
+        do_start_managed_forcola(
+          config,
+          redis_server_bin,
+          redis_cli_bin,
+          timeout,
+          distribution
+        )
       end
     else
       {:error, :forcola_not_available}
     end
   end
 
-  defp do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp do_start_managed_forcola(
+         config,
+         redis_server_bin,
+         redis_cli_bin,
+         timeout,
+         distribution
+       ) do
     node_dir = make_node_dir(config.port)
 
     config = %{
@@ -438,7 +486,7 @@ defmodule RedisServerWrapper.Server do
     server_bin_path = System.find_executable(redis_server_bin)
 
     # If using the redis-stack binary, load the Stack modules
-    module_args = detect_stack_modules(server_bin_path)
+    module_args = distribution_module_args(distribution, server_bin_path)
 
     cli =
       Cli.new(
@@ -465,6 +513,7 @@ defmodule RedisServerWrapper.Server do
           pid: read_pidfile(Path.join(node_dir, "redis.pid")),
           node_dir: node_dir,
           redis_server_bin: redis_server_bin,
+          distribution: distribution,
           daemon: daemon,
           managed: :forcola
         }
@@ -494,13 +543,13 @@ defmodule RedisServerWrapper.Server do
   # whose pid is in the pidfile" heuristic would silently murder live,
   # wanted instances. If the port is held, check_port_available returns
   # {:error, {:port_in_use, ...}} and the caller decides what to do.
-  defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
     with :ok <- check_port_available(Config.control_host(config), config.port) do
-      do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
+      do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution)
     end
   end
 
-  defp do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
+  defp do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout, distribution) do
     node_dir = make_node_dir(config.port)
     pidfile_path = Path.join(node_dir, "redis.pid")
 
@@ -518,7 +567,7 @@ defmodule RedisServerWrapper.Server do
     server_bin_path = System.find_executable(redis_server_bin) || redis_server_bin
 
     # If using the redis-stack binary, load the Stack modules
-    module_args = detect_stack_modules(server_bin_path)
+    module_args = distribution_module_args(distribution, server_bin_path)
 
     case System.cmd(server_bin_path, [conf_path | module_args], stderr_to_stdout: true) do
       {_output, 0} ->
@@ -540,6 +589,7 @@ defmodule RedisServerWrapper.Server do
               pid: pid,
               node_dir: node_dir,
               redis_server_bin: redis_server_bin,
+              distribution: distribution,
               managed: false
             }
 
@@ -690,10 +740,10 @@ defmodule RedisServerWrapper.Server do
 
   defp warn_if_signal_unavailable(_result, _pid), do: :ok
 
-  # Detect Redis Stack modules (RedisJSON, RediSearch, etc.) if we're using
-  # the redis-stack binary. Returns command-line args like
+  # Detect Redis Stack modules (RedisJSON, RediSearch, etc.) only when the
+  # legacy Stack distribution is explicitly selected. Returns command-line args like
   # ["--loadmodule", "/path/to/rejson.so", "--loadmodule", "/path/to/redisearch.so", ...]
-  defp detect_stack_modules(server_bin_path) do
+  defp distribution_module_args(:legacy_stack, server_bin_path) do
     # Check if this binary lives inside a redis-stack installation
     bin_dir = Path.dirname(server_bin_path)
     lib_dir = Path.join(Path.dirname(bin_dir), "lib")
@@ -714,6 +764,8 @@ defmodule RedisServerWrapper.Server do
       []
     end
   end
+
+  defp distribution_module_args(_distribution, _server_bin_path), do: []
 
   defp module_args(lib_dir, {mod_file, args}) do
     mod_path = Path.join(lib_dir, mod_file)

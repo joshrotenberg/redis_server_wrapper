@@ -58,6 +58,7 @@ defmodule RedisServerWrapper.Manager do
     * `:persist` - enable persistence (default: false)
     * `:maxmemory` - memory limit (e.g., "256mb")
     * `:loadmodule` - modules to load; accepts paths or `{path, [args]}` tuples
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * Plus any `RedisServerWrapper.Config` options via `:extra`
   """
   @spec start_basic(keyword()) :: {:ok, instance()} | {:error, term()}
@@ -75,6 +76,7 @@ defmodule RedisServerWrapper.Manager do
     persist = Keyword.get(opts, :persist, false)
     maxmemory = Keyword.get(opts, :maxmemory)
     loadmodule = Keyword.get(opts, :loadmodule, [])
+    distribution = Keyword.get(opts, :distribution, :core)
     extra = Keyword.get(opts, :extra, [])
 
     if Map.has_key?(state.instances, name) do
@@ -89,6 +91,7 @@ defmodule RedisServerWrapper.Manager do
           save: if(persist, do: :default, else: :disabled),
           appendonly: persist,
           managed: false,
+          distribution: distribution,
           loadmodule: loadmodule
         ]
         |> maybe_put(:maxmemory, maxmemory)
@@ -139,6 +142,7 @@ defmodule RedisServerWrapper.Manager do
     * `:bind` - bind address (default: "127.0.0.1")
     * `:control_host` - address used for client and cluster operations
     * `:loadmodule` - modules loaded into every cluster node
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
   """
   @spec start_cluster(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_cluster(opts \\ []) do
@@ -155,6 +159,7 @@ defmodule RedisServerWrapper.Manager do
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     control_host = Keyword.get(opts, :control_host)
     loadmodule = Keyword.get(opts, :loadmodule, [])
+    distribution = Keyword.get(opts, :distribution, :core)
 
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
@@ -167,6 +172,7 @@ defmodule RedisServerWrapper.Manager do
         control_host: control_host,
         password: password,
         managed: false,
+        distribution: distribution,
         loadmodule: loadmodule
       ]
 
@@ -223,6 +229,7 @@ defmodule RedisServerWrapper.Manager do
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
     * `:loadmodule` - modules loaded into the master and every replica
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
   """
   @spec start_sentinel(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_sentinel(opts \\ []) do
@@ -241,6 +248,7 @@ defmodule RedisServerWrapper.Manager do
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     control_host = Keyword.get(opts, :control_host)
     loadmodule = Keyword.get(opts, :loadmodule, [])
+    distribution = Keyword.get(opts, :distribution, :core)
 
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
@@ -255,6 +263,7 @@ defmodule RedisServerWrapper.Manager do
         control_host: control_host,
         password: password,
         managed: false,
+        distribution: distribution,
         loadmodule: loadmodule
       ]
 
