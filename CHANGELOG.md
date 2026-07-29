@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.6.1...v0.7.0) (2026-07-29)
+
+
+### Features
+
+* add managed: :forcola backend for guaranteed redis-server teardown ([#33](https://github.com/joshrotenberg/redis_server_wrapper/issues/33)) ([b246c51](https://github.com/joshrotenberg/redis_server_wrapper/commit/b246c510c92f27ea135562cdfd265588fca9168c))
+* add structured Redis module loading ([#37](https://github.com/joshrotenberg/redis_server_wrapper/issues/37)) ([262cc17](https://github.com/joshrotenberg/redis_server_wrapper/commit/262cc179e53a0ac1b30f000d7d9f922d2d8ca862))
+
 ## [0.6.1](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.6.0...v0.6.1) (2026-04-15)
 
 
