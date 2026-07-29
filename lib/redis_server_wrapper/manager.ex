@@ -82,7 +82,7 @@ defmodule RedisServerWrapper.Manager do
         |> maybe_put(:maxmemory, maxmemory)
         |> maybe_put(:extra, if(extra != [], do: extra))
 
-      case Server.start_link(server_opts) do
+      case Server.start(server_opts) do
         {:ok, pid} ->
           info = Server.info(pid)
           Server.detach(pid)
@@ -151,7 +151,7 @@ defmodule RedisServerWrapper.Manager do
         loadmodule: loadmodule
       ]
 
-      case Cluster.start_link(cluster_opts) do
+      case Cluster.start(cluster_opts) do
         {:ok, pid} ->
           cluster_info = Cluster.info(pid)
           total_nodes = cluster_info.total_nodes
@@ -230,7 +230,7 @@ defmodule RedisServerWrapper.Manager do
         loadmodule: loadmodule
       ]
 
-      case Sentinel.start_link(sentinel_opts) do
+      case Sentinel.start(sentinel_opts) do
         {:ok, pid} ->
           sen_info = Sentinel.info(pid)
 

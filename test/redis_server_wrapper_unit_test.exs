@@ -1,0 +1,166 @@
+defmodule RedisServerWrapperUnitTest do
+  use ExUnit.Case, async: false
+
+  alias RedisServerWrapper.{Cli, Server}
+
+  setup do
+    fixture_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "redis-server-wrapper-tests",
+        "unit-#{System.unique_integer([:positive])}"
+      ])
+
+    File.mkdir_p!(fixture_dir)
+
+    cli_bin =
+      write_executable(
+        fixture_dir,
+        "fake-redis-cli",
+        ~S"""
+        #!/bin/sh
+        args="$*"
+
+        case "$args" in
+          *"--cluster create"*)
+            case "$args" in
+              *"failnode"*) echo "cluster-create-error"; exit 2 ;;
+              *) echo "cluster-created" ;;
+            esac
+            ;;
+          *"CLUSTER INFO"*)
+            case "$args" in
+              *"-h error "*) echo "cluster-info-error"; exit 2 ;;
+              *) printf '# Stats\ncluster_state:ok\norphan\n' ;;
+            esac
+            ;;
+          *"SENTINEL MASTER"*)
+            case "$args" in
+              *"-h error "*) echo "sentinel-error"; exit 2 ;;
+              *) printf 'name\nmymaster\norphan\n' ;;
+            esac
+            ;;
+          *"PING"*)
+            case "$args" in
+              *"-h ready "*) echo "PONG" ;;
+              *"-h loading "*) echo "LOADING dataset" ;;
+              *"-h busy "*) echo "BUSY running" ;;
+              *"-h unexpected "*) echo "NOPE" ;;
+              *) echo "connection-refused"; exit 2 ;;
+            esac
+            ;;
+          *"FAIL"*) echo "failure"; exit 2 ;;
+          *) echo "$args" ;;
+        esac
+        """
+      )
+
+    version_bin =
+      write_executable(fixture_dir, "versioned-server", "#!/bin/sh\necho 'redis v=9.8.7'\n")
+
+    plain_version_bin =
+      write_executable(fixture_dir, "plain-server", "#!/bin/sh\necho 'custom redis build'\n")
+
+    failing_version_bin =
+      write_executable(
+        fixture_dir,
+        "failing-server",
+        "#!/bin/sh\necho 'version failed'; exit 2\n"
+      )
+
+    on_exit(fn -> File.rm_rf!(fixture_dir) end)
+
+    {:ok,
+     cli_bin: cli_bin,
+     version_bin: version_bin,
+     plain_version_bin: plain_version_bin,
+     failing_version_bin: failing_version_bin}
+  end
+
+  test "CLI runs commands, assembles connection options, and raises on errors", %{cli_bin: bin} do
+    assert %Cli{host: "127.0.0.1", port: 6379} = Cli.new()
+
+    cli = Cli.new(bin: bin, host: "ready", port: 6380, password: "secret", tls: true)
+
+    assert {:ok, args} = Cli.run(cli, ["ECHO"])
+    assert args =~ "-h ready -p 6380"
+    assert args =~ "-a secret --no-auth-warning"
+    assert args =~ "--tls ECHO"
+    assert Cli.run!(cli, ["ECHO"]) =~ "--tls ECHO"
+    assert Cli.ping(cli)
+
+    assert {:error, "failure"} = Cli.run(cli, ["FAIL"])
+    assert_raise RuntimeError, ~r/redis-cli error: failure/, fn -> Cli.run!(cli, ["FAIL"]) end
+    refute Cli.ping(%{cli | host: "error"})
+  end
+
+  test "CLI readiness distinguishes ready, transient, failed, and unexpected peers", %{
+    cli_bin: bin
+  } do
+    assert :ok = Cli.wait_for_ready(Cli.new(bin: bin, host: "ready"), 20)
+    assert :ok = Cli.wait_for_ready(Cli.new(bin: bin, host: "ready"))
+
+    assert {:error, {:unexpected_reply, "NOPE"}} =
+             Cli.wait_for_ready(Cli.new(bin: bin, host: "unexpected"), 20)
+
+    assert {:error, :timeout} = Cli.wait_for_ready(Cli.new(bin: bin, host: "loading"), 20)
+    assert {:error, :timeout} = Cli.wait_for_ready(Cli.new(bin: bin, host: "busy"), 20)
+    assert {:error, :timeout} = Cli.wait_for_ready(Cli.new(bin: bin, host: "error"), 20)
+  end
+
+  test "CLI cluster and sentinel helpers parse success and preserve errors", %{cli_bin: bin} do
+    authenticated = Cli.new(bin: bin, password: "secret")
+
+    assert {:ok, "cluster-created"} =
+             Cli.cluster_create(authenticated, ["127.0.0.1:7000"], 1)
+
+    assert {:error, "cluster-create-error"} =
+             Cli.cluster_create(Cli.new(bin: bin), ["failnode"])
+
+    assert {:ok, %{"cluster_state" => "ok", "orphan" => ""}} =
+             Cli.cluster_info(Cli.new(bin: bin, host: "ready"))
+
+    assert {:error, "cluster-info-error"} =
+             Cli.cluster_info(Cli.new(bin: bin, host: "error"))
+
+    assert {:ok, %{"name" => "mymaster", "orphan" => ""}} =
+             Cli.sentinel_master(Cli.new(bin: bin, host: "ready"), "mymaster")
+
+    assert {:error, "sentinel-error"} =
+             Cli.sentinel_master(Cli.new(bin: bin, host: "error"), "mymaster")
+  end
+
+  test "top-level availability and version helpers cover every result shape", context do
+    assert RedisServerWrapper.available?(context.version_bin)
+    refute RedisServerWrapper.available?("definitely-missing-redis-binary")
+
+    assert {:ok, "9.8.7"} = RedisServerWrapper.version(context.version_bin)
+    assert {:ok, "custom redis build"} = RedisServerWrapper.version(context.plain_version_bin)
+    assert {:error, output} = RedisServerWrapper.version(context.failing_version_bin)
+    assert output =~ "version failed"
+
+    assert {:error, {:binary_not_found, "definitely-missing-redis-binary"}} =
+             RedisServerWrapper.version("definitely-missing-redis-binary")
+  end
+
+  test "Server reports missing binaries and managed/unmanaged startup failures" do
+    assert {:error, {:binary_not_found, "missing-redis-server"}} =
+             Server.start(name: :missing_binary_server, redis_server_bin: "missing-redis-server")
+
+    assert {:error, {:binary_not_found, "missing-redis-cli"}} =
+             Server.start(redis_cli_bin: "missing-redis-cli")
+
+    assert {:error, {:server_start_failed, 6440, _status, _output}} =
+             Server.start(port: 6440, managed: false, redis_server_bin: "false")
+
+    assert {:error, {:server_start_timeout, 6441}} =
+             Server.start(port: 6441, managed: true, redis_server_bin: "false", timeout: 20)
+  end
+
+  defp write_executable(dir, name, contents) do
+    path = Path.join(dir, name)
+    File.write!(path, contents)
+    File.chmod!(path, 0o755)
+    path
+  end
+end

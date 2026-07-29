@@ -146,7 +146,7 @@ defmodule RedisServerWrapperTest do
 
   describe "Server" do
     test "start, ping, run commands, stop" do
-      {:ok, server} = Server.start_link(port: 6400)
+      {:ok, server} = RedisServerWrapper.start_server(port: 6400)
 
       assert Server.ping(server)
       assert Server.alive?(server)
@@ -376,19 +376,96 @@ defmodule RedisServerWrapperTest do
         File.rm_rf!(temp_dir)
       end)
 
-      :ok
+      {:ok, state_file: state_file}
     end
 
     test "basic instances remain running after the launcher GenServer exits" do
-      assert {:ok, instance} =
-               Manager.start_basic(name: "demo-persistent", port: 6430, password: nil)
+      assert {:ok, instance} = Manager.start_basic(port: 6430)
+      on_exit(fn -> Manager.stop(instance.name) end)
 
       assert [_ | _] = instance.pids
-      assert wait_until(fn -> Cli.ping(Cli.new(port: 6430)) end, 5, 200)
-      assert {:ok, %{status: :running}} = Manager.info("demo-persistent")
+      assert instance.name == "redis-basic-1"
+      assert is_binary(instance.password)
+      assert String.length(instance.password) == 16
+      assert instance.url =~ instance.password
 
-      assert :ok = Manager.stop("demo-persistent")
-      assert wait_until(fn -> not Cli.ping(Cli.new(port: 6430)) end, 5, 200)
+      cli = Cli.new(port: 6430, password: instance.password)
+      assert wait_until(fn -> Cli.ping(cli) end, 5, 200)
+      assert {:ok, %{status: :running}} = Manager.info(instance.name)
+
+      assert {:error, {:instance_exists, "redis-basic-1"}} =
+               Manager.start_basic(name: instance.name, port: 6430)
+
+      assert :ok = Manager.stop(instance.name)
+      assert wait_until(fn -> not Cli.ping(cli) end, 5, 200)
+    end
+
+    test "persisted state supports listing, filtering, details, and missing names", %{
+      state_file: state_file
+    } do
+      write_manager_state(state_file, %{
+        "dead-basic" => manager_instance("dead-basic", "basic", "2026-01-01T00:00:00Z"),
+        "dead-cluster" => manager_instance("dead-cluster", "cluster", "2026-01-02T00:00:00Z")
+      })
+
+      assert Enum.map(Manager.list(), & &1.name) == ["dead-basic", "dead-cluster"]
+      assert Enum.map(Manager.list(:cluster), & &1.name) == ["dead-cluster"]
+
+      assert {:ok, info} = Manager.info("dead-basic")
+      assert info.status == :stopped
+      assert info.metadata == %{nested: %{enabled: true}, items: [%{value: 1}]}
+
+      assert {:error, :not_found} = Manager.info("missing")
+      assert {:error, :not_found} = Manager.stop("missing")
+    end
+
+    test "cleanup removes dead persisted instances", %{state_file: state_file} do
+      write_manager_state(state_file, %{
+        "dead-basic" => manager_instance("dead-basic", "basic", "2026-01-01T00:00:00Z"),
+        "dead-cluster" => manager_instance("dead-cluster", "cluster", "2026-01-02T00:00:00Z")
+      })
+
+      assert Manager.cleanup() == {0, 2}
+      assert Manager.list() == []
+    end
+
+    test "stop_all clears persisted instances and counters", %{state_file: state_file} do
+      write_manager_state(
+        state_file,
+        %{"dead-basic" => manager_instance("dead-basic", "basic", "2026-01-01T00:00:00Z")},
+        %{"basic" => 4}
+      )
+
+      assert :ok = Manager.stop_all()
+      assert Manager.list() == []
+    end
+
+    test "topology launchers preserve startup errors" do
+      invalid_modules = [{"/missing/module.so", [:not_a_string]}]
+
+      assert {:error, _reason} =
+               Manager.start_basic(
+                 name: "invalid-basic",
+                 port: 6442,
+                 password: nil,
+                 loadmodule: invalid_modules
+               )
+
+      assert {:error, _reason} =
+               Manager.start_cluster(
+                 name: "invalid-cluster",
+                 base_port: 7440,
+                 password: nil,
+                 loadmodule: invalid_modules
+               )
+
+      assert {:error, _reason} =
+               Manager.start_sentinel(
+                 name: "invalid-sentinel",
+                 master_port: 6480,
+                 password: nil,
+                 loadmodule: invalid_modules
+               )
     end
 
     @tag timeout: 30_000
@@ -451,7 +528,7 @@ defmodule RedisServerWrapperTest do
   describe "Cluster" do
     @tag timeout: 30_000
     test "start 3-master cluster, verify health, stop" do
-      {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7100)
+      {:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7100)
 
       assert Cluster.all_alive?(cluster)
       assert wait_until(fn -> Cluster.healthy?(cluster) end)
@@ -460,6 +537,7 @@ defmodule RedisServerWrapperTest do
       assert info.masters == 3
       assert info.total_nodes == 3
       assert length(info.node_addrs) == 3
+      assert Cluster.node_addrs(cluster) == info.node_addrs
 
       addr = Cluster.addr(cluster)
       assert addr == "127.0.0.1:7100"
@@ -488,7 +566,7 @@ defmodule RedisServerWrapperTest do
     @tag timeout: 30_000
     test "start sentinel topology, verify health, stop" do
       {:ok, sentinel} =
-        Sentinel.start_link(
+        RedisServerWrapper.start_sentinel(
           master_port: 6500,
           replicas: 2,
           sentinels: 3
@@ -501,6 +579,13 @@ defmodule RedisServerWrapperTest do
       assert info.replicas == 2
       assert info.sentinels == 3
       assert length(info.sentinel_addrs) == 3
+      assert Sentinel.master_addr(sentinel) == "127.0.0.1:6500"
+
+      assert Sentinel.sentinel_addrs(sentinel) == [
+               "127.0.0.1:26389",
+               "127.0.0.1:26390",
+               "127.0.0.1:26391"
+             ]
 
       assert {:ok, master_info} = Sentinel.poke(sentinel)
       assert master_info["flags"] == "master"
@@ -509,5 +594,28 @@ defmodule RedisServerWrapperTest do
       Sentinel.stop(sentinel)
       Process.sleep(1000)
     end
+  end
+
+  defp write_manager_state(path, instances, counters \\ %{}) do
+    state = %{"instances" => instances, "counters" => counters}
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, JSON.encode!(state))
+  end
+
+  defp manager_instance(name, type, created_at) do
+    %{
+      "name" => name,
+      "type" => type,
+      "created_at" => created_at,
+      "bind" => "127.0.0.1",
+      "ports" => [],
+      "pids" => [99_999_999],
+      "password" => "secret",
+      "url" => "redis://:secret@127.0.0.1:6379",
+      "metadata" => %{
+        "nested" => %{"enabled" => true},
+        "items" => [%{"value" => 1}]
+      }
+    }
   end
 end

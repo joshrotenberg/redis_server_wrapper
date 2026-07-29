@@ -74,7 +74,12 @@ jobs:
         run: mix dialyzer
 
       - name: Run tests
+        if: matrix.elixir != '1.20' || matrix.otp != '29'
         run: mix test
+
+      - name: Run tests with coverage gate
+        if: matrix.elixir == '1.20' && matrix.otp == '29'
+        run: mix test --cover
 
   docs:
     name: Docs

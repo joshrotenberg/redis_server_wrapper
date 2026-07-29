@@ -17,6 +17,7 @@ defmodule RedisServerWrapper.MixProject do
       docs: docs(),
       source_url: @source_url,
       homepage_url: @source_url,
+      test_coverage: [summary: [threshold: 90]],
       dialyzer: [plt_file: {:no_warn, "_build/dev/dialyxir_#{System.otp_release()}.plt"}]
     ]
   end
