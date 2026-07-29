@@ -3,19 +3,14 @@ defmodule RedisServerWrapper.Cli do
   Wrapper around the `redis-cli` binary for running commands against Redis instances.
   """
 
+  alias RedisServerWrapper.Connection
+
   @type t :: %__MODULE__{
           bin: String.t(),
-          host: String.t(),
-          port: non_neg_integer(),
-          password: String.t() | nil,
-          tls: boolean()
+          connection: Connection.t()
         }
 
-  defstruct bin: "redis-cli",
-            host: "127.0.0.1",
-            port: 6379,
-            password: nil,
-            tls: false
+  defstruct bin: "redis-cli", connection: %Connection{}
 
   @doc """
   Creates a new Cli struct.
@@ -24,7 +19,24 @@ defmodule RedisServerWrapper.Cli do
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
-    struct!(__MODULE__, opts)
+    {bin, opts} = Keyword.pop(opts, :bin, "redis-cli")
+
+    connection =
+      case Keyword.pop(opts, :connection) do
+        {%Connection{} = connection, []} ->
+          connection
+
+        {nil, connection_opts} ->
+          connection_opts
+          |> normalize_legacy_options()
+          |> Connection.new()
+
+        {%Connection{}, remaining} ->
+          raise ArgumentError,
+                ":connection cannot be combined with connection options: #{inspect(remaining)}"
+      end
+
+    %__MODULE__{bin: bin, connection: connection}
   end
 
   @doc """
@@ -67,8 +79,10 @@ defmodule RedisServerWrapper.Cli do
   """
   @spec shutdown(t()) :: :ok
   def shutdown(%__MODULE__{} = cli) do
-    # Fire and forget - the connection will be closed by the server
-    spawn(fn -> run(cli, ["SHUTDOWN", "NOSAVE"]) end)
+    # redis-cli tolerates the server closing the connection as part of shutdown.
+    # Wait for the attempt to finish so a delayed command cannot hit a later
+    # process that reuses the same endpoint.
+    _result = run(cli, ["SHUTDOWN", "NOSAVE"])
     :ok
   end
 
@@ -136,7 +150,8 @@ defmodule RedisServerWrapper.Cli do
           {:ok, String.t()} | {:error, String.t()}
   def cluster_create(%__MODULE__{} = cli, node_addrs, replicas_per_master \\ 0) do
     args =
-      ["--cluster", "create"] ++
+      Connection.cli_args(cli.connection, include_endpoint: false) ++
+        ["--cluster", "create"] ++
         node_addrs ++
         ["--cluster-replicas", to_string(replicas_per_master), "--cluster-yes"]
 
@@ -170,8 +185,7 @@ defmodule RedisServerWrapper.Cli do
 
   # Build base connection arguments for redis-cli
   defp base_args(%__MODULE__{} = cli) do
-    ["-h", cli.host, "-p", to_string(cli.port)]
-    |> maybe_append(cli.tls, fn _ -> ["--tls"] end)
+    Connection.cli_args(cli.connection)
   end
 
   defp run_command(cli, args) do
@@ -179,16 +193,25 @@ defmodule RedisServerWrapper.Cli do
       cli.bin,
       args,
       stderr_to_stdout: true,
-      env: auth_env(cli)
+      env: Connection.cli_env(cli.connection)
     )
   end
 
-  defp auth_env(%__MODULE__{password: nil}), do: []
-  defp auth_env(%__MODULE__{password: password}), do: [{"REDISCLI_AUTH", password}]
+  defp normalize_legacy_options(opts) do
+    tls = Keyword.get(opts, :tls, false)
+    socket = Keyword.get(opts, :socket)
 
-  defp maybe_append(args, nil, _fun), do: args
-  defp maybe_append(args, false, _fun), do: args
-  defp maybe_append(args, value, fun), do: args ++ fun.(value)
+    transport =
+      cond do
+        socket -> :unix
+        tls -> :tls
+        true -> Keyword.get(opts, :transport, :tcp)
+      end
+
+    opts
+    |> Keyword.delete(:tls)
+    |> Keyword.put(:transport, transport)
+  end
 
   # Parse "key:value\r\n" format (CLUSTER INFO, INFO)
   defp parse_info(output) do

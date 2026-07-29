@@ -1,7 +1,20 @@
 defmodule RedisServerWrapperTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, Config, Manager, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, Config, Connection, Manager, Sentinel, Server}
+
+  setup_all do
+    tls_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "redis-server-wrapper-tls-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(tls_dir)
+    tls = generate_tls_files!(tls_dir)
+    on_exit(fn -> File.rm_rf!(tls_dir) end)
+    {:ok, tls: tls}
+  end
 
   defp wait_until(fun, retries \\ 10, delay \\ 1000) do
     if fun.() do
@@ -175,7 +188,8 @@ defmodule RedisServerWrapperTest do
           tls_port: 6380,
           tls_cert_file: "/path/cert.pem",
           tls_key_file: "/path/key.pem",
-          tls_ca_cert_file: "/path/ca.pem"
+          tls_ca_cert_file: "/path/ca.pem",
+          tls_auth_clients: "no"
         )
 
       output = Config.to_config_string(config)
@@ -183,6 +197,39 @@ defmodule RedisServerWrapperTest do
       assert output =~ "tls-cert-file /path/cert.pem"
       assert output =~ "tls-key-file /path/key.pem"
       assert output =~ "tls-ca-cert-file /path/ca.pem"
+      assert output =~ "tls-auth-clients no"
+    end
+
+    test "named ACL auth and operational endpoint selection" do
+      acl = Config.new(username: "app user", password: "secret value")
+      output = Config.to_config_string(acl)
+
+      assert output =~ "user default off"
+      assert output =~ ~s(user "app user" on ">secret value" ~* &* +@all)
+      refute output =~ "requirepass"
+
+      assert %Connection{
+               transport: :tcp,
+               username: "app user",
+               password: "secret value"
+             } = Config.connection(acl)
+
+      unix = Config.new(port: 0, unixsocket: "/tmp/redis wrapper.sock")
+
+      assert %Connection{transport: :unix, socket: "/tmp/redis wrapper.sock"} =
+               Config.connection(unix)
+
+      assert_raise ArgumentError, ~r/:username requires/, fn ->
+        Config.new(username: "app")
+      end
+
+      assert_raise ArgumentError, ~r/at least one/, fn ->
+        Config.new(port: 0)
+      end
+
+      assert_raise ArgumentError, ~r/:unixsocket must be at most 103 bytes/, fn ->
+        Config.new(port: 0, unixsocket: "/" <> String.duplicate("a", 104))
+      end
     end
   end
 
@@ -237,6 +284,84 @@ defmodule RedisServerWrapperTest do
       Process.sleep(500)
     end
 
+    test "start over a Unix socket with TCP disabled" do
+      socket =
+        Path.join(
+          System.tmp_dir!(),
+          "redis-server-wrapper-#{System.unique_integer([:positive])}.sock"
+        )
+
+      {:ok, server} =
+        Server.start_link(
+          port: 0,
+          unixsocket: socket,
+          unixsocketperm: "700"
+        )
+
+      try do
+        assert Server.ping(server)
+        assert {:ok, "OK"} = Server.run(server, ["SET", "unix-key", "unix-value"])
+        assert {:ok, "unix-value"} = Server.run(server, ["GET", "unix-key"])
+        assert %Connection{transport: :unix, socket: ^socket} = Server.cli(server).connection
+      after
+        Server.stop(server)
+      end
+
+      refute File.exists?(socket)
+    end
+
+    test "start with named ACL credentials" do
+      {:ok, server} =
+        Server.start_link(
+          port: 6407,
+          username: "wrapper-app",
+          password: "acl secret"
+        )
+
+      try do
+        assert Server.ping(server)
+        assert {:ok, "OK"} = Server.run(server, ["SET", "acl-key", "acl-value"])
+        assert {:ok, "acl-value"} = Server.run(server, ["GET", "acl-key"])
+
+        assert %Connection{username: "wrapper-app", password: "acl secret"} =
+                 Server.cli(server).connection
+      after
+        Server.stop(server)
+      end
+    end
+
+    test "start TLS-only with CA verification, SNI, and client authentication", %{tls: tls} do
+      {:ok, server} =
+        Server.start_link(
+          port: 0,
+          tls_port: 6408,
+          tls_cert_file: tls.cert,
+          tls_key_file: tls.key,
+          tls_ca_cert_file: tls.ca,
+          tls_auth_clients: "yes",
+          tls_client_cert_file: tls.cert,
+          tls_client_key_file: tls.key,
+          tls_server_name: "localhost",
+          username: "tls-app",
+          password: "tls secret"
+        )
+
+      try do
+        assert Server.ping(server)
+        assert {:ok, "OK"} = Server.run(server, ["SET", "tls-key", "tls-value"])
+        assert {:ok, "tls-value"} = Server.run(server, ["GET", "tls-key"])
+
+        assert %Connection{
+                 transport: :tls,
+                 port: 6408,
+                 username: "tls-app",
+                 tls_server_name: "localhost"
+               } = Server.cli(server).connection
+      after
+        Server.stop(server)
+      end
+    end
+
     test "multiple listen addresses use an explicit control host" do
       {:ok, server} =
         Server.start_link(
@@ -249,7 +374,7 @@ defmodule RedisServerWrapperTest do
         assert Server.ping(server)
         assert Server.info(server).bind == ["127.0.0.1", "::1"]
         assert Server.info(server).host == "127.0.0.1"
-        assert Server.cli(server).host == "127.0.0.1"
+        assert Server.cli(server).connection.host == "127.0.0.1"
       after
         Server.stop(server)
       end
@@ -514,6 +639,44 @@ defmodule RedisServerWrapperTest do
 
       assert :ok = Manager.stop(instance.name)
       assert wait_until(fn -> not Cli.ping(cli) end, 5, 200)
+    end
+
+    test "Unix-socket instances persist their connection and stop cleanly" do
+      socket =
+        Path.join(
+          System.tmp_dir!(),
+          "rsw-manager-#{System.unique_integer([:positive])}.sock"
+        )
+
+      assert {:ok, instance} =
+               Manager.start_basic(
+                 name: "unix-basic",
+                 port: 0,
+                 unixsocket: socket,
+                 unixsocketperm: "700",
+                 username: "manager-app",
+                 password: "manager secret"
+               )
+
+      cli = Cli.new(connection: instance.connection)
+
+      try do
+        assert instance.ports == []
+        assert instance.url == "unix://#{URI.encode(socket)}"
+        assert instance.connection.transport == :unix
+        assert Cli.ping(cli)
+
+        assert {:ok, credentials} = Manager.credentials(instance.name)
+        assert credentials.username == "manager-app"
+        assert credentials.url == instance.url
+
+        assert :ok = Manager.stop(instance.name)
+        assert wait_until(fn -> not Cli.ping(cli) end, 5, 200)
+        refute File.exists?(socket)
+      after
+        if Cli.ping(cli), do: Manager.stop(instance.name)
+        File.rm(socket)
+      end
     end
 
     test "credentials stay out of default output and state is private", %{state_file: state_file} do
@@ -929,6 +1092,32 @@ defmodule RedisServerWrapperTest do
       Cluster.stop(cluster)
       Process.sleep(1000)
     end
+
+    @tag timeout: 30_000
+    test "TLS-only cluster forms and serves commands", %{tls: tls} do
+      {:ok, cluster} =
+        Cluster.start_link(
+          masters: 3,
+          base_port: 7120,
+          tls: true,
+          tls_cert_file: tls.cert,
+          tls_key_file: tls.key,
+          tls_ca_cert_file: tls.ca,
+          tls_auth_clients: "no",
+          tls_server_name: "localhost",
+          username: "cluster-app",
+          password: "cluster secret"
+        )
+
+      try do
+        assert Cluster.all_alive?(cluster)
+        assert wait_until(fn -> Cluster.healthy?(cluster) end)
+        assert {:ok, "PONG"} = Cluster.run(cluster, ["PING"])
+        assert Cluster.info(cluster).connection.transport == :tls
+      after
+        Cluster.stop(cluster)
+      end
+    end
   end
 
   describe "Sentinel" do
@@ -1011,6 +1200,122 @@ defmodule RedisServerWrapperTest do
 
       Sentinel.stop(sentinel)
       Process.sleep(1000)
+    end
+
+    @tag timeout: 30_000
+    test "TLS-only Sentinel uses named ACL auth for monitoring and replication", %{tls: tls} do
+      {:ok, sentinel} =
+        Sentinel.start_link(
+          master_port: 6520,
+          replicas: 1,
+          replica_base_port: 6521,
+          sentinels: 1,
+          sentinel_base_port: 26_520,
+          quorum: 1,
+          tls: true,
+          tls_cert_file: tls.cert,
+          tls_key_file: tls.key,
+          tls_ca_cert_file: tls.ca,
+          tls_auth_clients: "no",
+          tls_server_name: "localhost",
+          username: "sentinel-app",
+          password: "sentinel secret"
+        )
+
+      try do
+        assert wait_until(fn -> Sentinel.healthy?(sentinel) end)
+        assert {:ok, master_info} = Sentinel.poke(sentinel)
+        assert master_info["flags"] == "master"
+        assert Sentinel.info(sentinel).master_connection.transport == :tls
+      after
+        Sentinel.stop(sentinel)
+      end
+    end
+  end
+
+  defp generate_tls_files!(dir) do
+    openssl =
+      System.find_executable("openssl") ||
+        raise "openssl is required for Redis TLS integration tests"
+
+    ca_key = Path.join(dir, "ca.key")
+    ca = Path.join(dir, "ca.crt")
+    key = Path.join(dir, "server.key")
+    csr = Path.join(dir, "server.csr")
+    cert = Path.join(dir, "server.crt")
+    extensions = Path.join(dir, "server.ext")
+
+    openssl!(
+      openssl,
+      [
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-sha256",
+        "-days",
+        "2",
+        "-subj",
+        "/CN=RedisServerWrapper Test CA",
+        "-keyout",
+        ca_key,
+        "-out",
+        ca
+      ]
+    )
+
+    openssl!(
+      openssl,
+      [
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-sha256",
+        "-subj",
+        "/CN=localhost",
+        "-keyout",
+        key,
+        "-out",
+        csr
+      ]
+    )
+
+    File.write!(
+      extensions,
+      "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth,clientAuth\n"
+    )
+
+    openssl!(
+      openssl,
+      [
+        "x509",
+        "-req",
+        "-sha256",
+        "-days",
+        "2",
+        "-in",
+        csr,
+        "-CA",
+        ca,
+        "-CAkey",
+        ca_key,
+        "-CAcreateserial",
+        "-extfile",
+        extensions,
+        "-out",
+        cert
+      ]
+    )
+
+    %{ca: ca, cert: cert, key: key}
+  end
+
+  defp openssl!(openssl, args) do
+    case System.cmd(openssl, args, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "openssl failed (#{status}): #{output}"
     end
   end
 

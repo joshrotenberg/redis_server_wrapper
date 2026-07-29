@@ -29,6 +29,13 @@ defmodule RedisServerWrapper.Sentinel do
     * `:control_host` - address used by redis-cli, replication, and Sentinel
       monitoring (default: first bind address)
     * `:password` - Redis password
+    * `:username` - optional ACL username paired with `:password`
+    * `:tls` - use TLS-only data-node and Sentinel connections (default: false)
+    * `:tls_cert_file`, `:tls_key_file` - server certificate and private key
+    * `:tls_ca_cert_file` or `:tls_ca_cert_dir` - trusted CA for Redis and redis-cli
+    * `:tls_client_cert_file`, `:tls_client_key_file` - optional redis-cli client identity
+    * `:tls_server_name` - optional redis-cli SNI name
+    * `:tls_insecure` - explicitly disable redis-cli certificate verification
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
@@ -44,7 +51,7 @@ defmodule RedisServerWrapper.Sentinel do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, OSProcess, SecureFile, Server}
+  alias RedisServerWrapper.{Cli, Config, Connection, OSProcess, SecureFile, Server}
 
   require Logger
 
@@ -53,6 +60,9 @@ defmodule RedisServerWrapper.Sentinel do
     :master_port,
     :bind,
     :control_host,
+    :master_connection,
+    :sentinel_connection,
+    :username,
     :password,
     :redis_cli_bin,
     :master_pid,
@@ -140,13 +150,17 @@ defmodule RedisServerWrapper.Sentinel do
       |> Config.control_host()
 
     password = Keyword.get(opts, :password)
+    username = Keyword.get(opts, :username)
     distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     loadmodule = Keyword.get(opts, :loadmodule, [])
     managed = Keyword.get(opts, :managed, true)
 
-    with :ok <- Server.validate_distribution(distribution),
+    with :ok <- valid_port(:master_port, master_port),
+         :ok <- reject_unix_transport(opts),
+         {:ok, master_connection} <- build_connection(opts, control_host, master_port),
+         :ok <- Server.validate_distribution(distribution),
          redis_server_bin =
            Keyword.get_lazy(opts, :redis_server_bin, fn ->
              Server.default_server_bin(distribution)
@@ -154,7 +168,18 @@ defmodule RedisServerWrapper.Sentinel do
          node_opts = %{
            bind: bind,
            control_host: control_host,
+           username: username,
            password: password,
+           tls: master_connection.transport == :tls,
+           tls_cert_file: Keyword.get(opts, :tls_cert_file),
+           tls_key_file: Keyword.get(opts, :tls_key_file),
+           tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
+           tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
+           tls_auth_clients: Keyword.get(opts, :tls_auth_clients),
+           tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
+           tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
+           tls_server_name: Keyword.get(opts, :tls_server_name),
+           tls_insecure: Keyword.get(opts, :tls_insecure, false),
            distribution: distribution,
            redis_server_bin: redis_server_bin,
            redis_cli_bin: redis_cli_bin,
@@ -173,6 +198,7 @@ defmodule RedisServerWrapper.Sentinel do
            failover_timeout_ms: failover_timeout_ms,
            timeout: timeout
          },
+         :ok <- validate_server_connection_config(node_opts, master_port),
          :ok <- validate_options(validation_settings),
          {:ok, master_pid} <- start_master(master_port, node_opts),
          {:ok, replica_pids} <-
@@ -187,7 +213,18 @@ defmodule RedisServerWrapper.Sentinel do
              master_port: master_port,
              bind: bind,
              control_host: control_host,
+             username: username,
              password: password,
+             tls: master_connection.transport == :tls,
+             tls_cert_file: Keyword.get(opts, :tls_cert_file),
+             tls_key_file: Keyword.get(opts, :tls_key_file),
+             tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
+             tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
+             tls_auth_clients: Keyword.get(opts, :tls_auth_clients),
+             tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
+             tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
+             tls_server_name: Keyword.get(opts, :tls_server_name),
+             tls_insecure: Keyword.get(opts, :tls_insecure, false),
              quorum: quorum,
              down_after_ms: down_after_ms,
              failover_timeout_ms: failover_timeout_ms,
@@ -199,12 +236,16 @@ defmodule RedisServerWrapper.Sentinel do
       Process.sleep(2000)
 
       sentinel_ports = ports_from(sentinel_base_port, num_sentinels)
+      sentinel_connection = Connection.with_port(master_connection, sentinel_base_port)
 
       state = %__MODULE__{
         master_name: master_name,
         master_port: master_port,
         bind: bind,
         control_host: control_host,
+        master_connection: master_connection,
+        sentinel_connection: sentinel_connection,
+        username: username,
         password: password,
         redis_cli_bin: redis_cli_bin,
         master_pid: master_pid,
@@ -238,6 +279,8 @@ defmodule RedisServerWrapper.Sentinel do
       master_name: state.master_name,
       bind: state.bind,
       control_host: state.control_host,
+      master_connection: state.master_connection,
+      sentinel_connection: state.sentinel_connection,
       master_addr: format_addr(state.control_host, state.master_port),
       replicas: state.num_replicas,
       sentinels: state.num_sentinels,
@@ -250,7 +293,11 @@ defmodule RedisServerWrapper.Sentinel do
   def handle_call(:healthy?, _from, state) do
     result =
       Enum.any?(state.sentinel_ports, fn port ->
-        cli = Cli.new(bin: state.redis_cli_bin, host: state.control_host, port: port)
+        cli =
+          Cli.new(
+            bin: state.redis_cli_bin,
+            connection: Connection.with_port(state.sentinel_connection, port)
+          )
 
         case Cli.sentinel_master(cli, state.master_name) do
           {:ok, info} ->
@@ -273,7 +320,11 @@ defmodule RedisServerWrapper.Sentinel do
   def handle_call(:poke, _from, state) do
     result =
       Enum.find_value(state.sentinel_ports, {:error, :no_reachable_sentinel}, fn port ->
-        cli = Cli.new(bin: state.redis_cli_bin, host: state.control_host, port: port)
+        cli =
+          Cli.new(
+            bin: state.redis_cli_bin,
+            connection: Connection.with_port(state.sentinel_connection, port)
+          )
 
         case Cli.sentinel_master(cli, state.master_name) do
           {:ok, info} -> {:ok, info}
@@ -337,17 +388,18 @@ defmodule RedisServerWrapper.Sentinel do
 
   defp start_master(port, node_opts) do
     Server.start_link(
-      port: port,
-      bind: node_opts.bind,
-      control_host: node_opts.control_host,
-      password: node_opts.password,
-      distribution: node_opts.distribution,
-      redis_server_bin: node_opts.redis_server_bin,
-      redis_cli_bin: node_opts.redis_cli_bin,
-      timeout: node_opts.timeout,
-      managed: node_opts.managed,
-      loadmodule: node_opts.loadmodule,
-      save: :disabled
+      connection_server_opts(node_opts, port) ++
+        [
+          bind: node_opts.bind,
+          control_host: node_opts.control_host,
+          distribution: node_opts.distribution,
+          redis_server_bin: node_opts.redis_server_bin,
+          redis_cli_bin: node_opts.redis_cli_bin,
+          timeout: node_opts.timeout,
+          managed: node_opts.managed,
+          loadmodule: node_opts.loadmodule,
+          save: :disabled
+        ]
     )
   end
 
@@ -358,21 +410,22 @@ defmodule RedisServerWrapper.Sentinel do
       Enum.reduce_while(0..(count - 1), {:ok, []}, fn i, {:ok, acc} ->
         port = base_port + i
 
-        opts = [
-          port: port,
-          bind: node_opts.bind,
-          control_host: node_opts.control_host,
-          password: node_opts.password,
-          distribution: node_opts.distribution,
-          masterauth: node_opts.password,
-          replicaof: {node_opts.control_host, master_port},
-          redis_server_bin: node_opts.redis_server_bin,
-          redis_cli_bin: node_opts.redis_cli_bin,
-          timeout: node_opts.timeout,
-          managed: node_opts.managed,
-          loadmodule: node_opts.loadmodule,
-          save: :disabled
-        ]
+        opts =
+          connection_server_opts(node_opts, port) ++
+            [
+              bind: node_opts.bind,
+              control_host: node_opts.control_host,
+              distribution: node_opts.distribution,
+              masteruser: node_opts.username,
+              masterauth: node_opts.password,
+              replicaof: {node_opts.control_host, master_port},
+              redis_server_bin: node_opts.redis_server_bin,
+              redis_cli_bin: node_opts.redis_cli_bin,
+              timeout: node_opts.timeout,
+              managed: node_opts.managed,
+              loadmodule: node_opts.loadmodule,
+              save: :disabled
+            ]
 
         case Server.start_link(opts) do
           {:ok, pid} ->
@@ -432,8 +485,7 @@ defmodule RedisServerWrapper.Sentinel do
       conf_path,
       node_dir,
       opts.redis_cli_bin,
-      opts.control_host,
-      port,
+      sentinel_connection(opts, port),
       opts.timeout
     )
   end
@@ -444,7 +496,9 @@ defmodule RedisServerWrapper.Sentinel do
       control_host: control_host,
       master_name: master_name,
       master_port: master_port,
+      username: username,
       password: password,
+      tls: tls,
       quorum: quorum,
       down_after_ms: down_after_ms,
       failover_timeout_ms: failover_timeout_ms
@@ -452,28 +506,57 @@ defmodule RedisServerWrapper.Sentinel do
 
     listen_addresses = Config.new(bind: bind) |> Config.listen_addresses()
 
-    lines = [
-      Config.directive("port", [port]),
-      Config.directive("bind", listen_addresses),
-      Config.directive("daemonize", ["yes"]),
-      Config.directive("pidfile", [Path.join(dir, "sentinel.pid")]),
-      Config.directive("logfile", [Path.join(dir, "sentinel.log")]),
-      Config.directive("dir", [dir]),
-      Config.directive("sentinel", ["monitor", master_name, control_host, master_port, quorum]),
-      Config.directive("sentinel", ["down-after-milliseconds", master_name, down_after_ms]),
-      Config.directive("sentinel", ["failover-timeout", master_name, failover_timeout_ms]),
-      Config.directive("sentinel", ["parallel-syncs", master_name, 1])
-    ]
-
     lines =
-      if password do
-        lines ++ [Config.directive("sentinel", ["auth-pass", master_name, password])]
-      else
-        lines
-      end
+      [
+        Config.directive("port", [if(tls, do: 0, else: port)]),
+        Config.directive("bind", listen_addresses),
+        Config.directive("daemonize", ["yes"]),
+        Config.directive("pidfile", [Path.join(dir, "sentinel.pid")]),
+        Config.directive("logfile", [Path.join(dir, "sentinel.log")]),
+        Config.directive("dir", [dir]),
+        Config.directive("sentinel", ["monitor", master_name, control_host, master_port, quorum]),
+        Config.directive("sentinel", ["down-after-milliseconds", master_name, down_after_ms]),
+        Config.directive("sentinel", ["failover-timeout", master_name, failover_timeout_ms]),
+        Config.directive("sentinel", ["parallel-syncs", master_name, 1])
+      ] ++ sentinel_tls_lines(opts, port) ++ sentinel_auth_lines(username, password, master_name)
 
     Enum.join(lines, "\n") <> "\n"
   end
+
+  defp sentinel_tls_lines(%{tls: false}, _port), do: []
+
+  defp sentinel_tls_lines(opts, port) do
+    [
+      Config.directive("tls-port", [port]),
+      Config.directive("tls-cert-file", [opts.tls_cert_file]),
+      Config.directive("tls-key-file", [opts.tls_key_file])
+    ] ++
+      optional_directive("tls-ca-cert-file", opts.tls_ca_cert_file) ++
+      optional_directive("tls-ca-cert-dir", opts.tls_ca_cert_dir) ++
+      optional_directive("tls-auth-clients", opts.tls_auth_clients) ++
+      [Config.directive("tls-replication", ["yes"])]
+  end
+
+  defp sentinel_auth_lines(nil, nil, _master_name), do: []
+
+  defp sentinel_auth_lines(nil, password, master_name) do
+    [
+      Config.directive("requirepass", [password]),
+      Config.directive("sentinel", ["auth-pass", master_name, password])
+    ]
+  end
+
+  defp sentinel_auth_lines(username, password, master_name) do
+    [
+      Config.directive("user", ["default", "off"]),
+      Config.directive("user", [username, "on", ">#{password}", "~*", "&*", "+@all"]),
+      Config.directive("sentinel", ["auth-user", master_name, username]),
+      Config.directive("sentinel", ["auth-pass", master_name, password])
+    ]
+  end
+
+  defp optional_directive(_key, nil), do: []
+  defp optional_directive(key, value), do: [Config.directive(key, [value])]
 
   defp kill_pids(pids) do
     Enum.each(pids, fn pid ->
@@ -486,8 +569,7 @@ defmodule RedisServerWrapper.Sentinel do
          conf_path,
          node_dir,
          redis_cli_bin,
-         bind,
-         port,
+         connection,
          timeout
        ) do
     # Sentinel rewrites its configuration as topology state changes. Launch it
@@ -505,7 +587,7 @@ defmodule RedisServerWrapper.Sentinel do
     case System.cmd("/bin/sh", command_args, stderr_to_stdout: true) do
       {_output, 0} ->
         # Wait for sentinel to be ready
-        cli = Cli.new(bin: redis_cli_bin, host: bind, port: port)
+        cli = Cli.new(bin: redis_cli_bin, connection: connection)
 
         case Cli.wait_for_ready(cli, timeout) do
           :ok ->
@@ -514,15 +596,90 @@ defmodule RedisServerWrapper.Sentinel do
             {:ok, pid}
 
           {:error, :timeout} ->
-            {:error, {:sentinel_start_timeout, port}}
+            {:error, {:sentinel_start_timeout, connection.port}}
 
           {:error, {:unexpected_reply, reply}} ->
-            {:error, {:sentinel_port_in_use, port, reply}}
+            {:error, {:sentinel_port_in_use, connection.port, reply}}
         end
 
       {output, code} ->
-        {:error, {:sentinel_start_failed, port, code, output}}
+        {:error, {:sentinel_start_failed, connection.port, code, output}}
     end
+  end
+
+  defp connection_server_opts(%{tls: false} = opts, port) do
+    [
+      port: port,
+      username: opts.username,
+      password: opts.password
+    ]
+  end
+
+  defp connection_server_opts(%{tls: true} = opts, port) do
+    [
+      port: 0,
+      tls_port: port,
+      username: opts.username,
+      password: opts.password,
+      tls_cert_file: opts.tls_cert_file,
+      tls_key_file: opts.tls_key_file,
+      tls_ca_cert_file: opts.tls_ca_cert_file,
+      tls_ca_cert_dir: opts.tls_ca_cert_dir,
+      tls_auth_clients: opts.tls_auth_clients,
+      tls_client_cert_file: opts.tls_client_cert_file,
+      tls_client_key_file: opts.tls_client_key_file,
+      tls_server_name: opts.tls_server_name,
+      tls_insecure: opts.tls_insecure,
+      tls_replication: true
+    ]
+  end
+
+  defp build_connection(opts, host, port) do
+    transport = if Keyword.get(opts, :tls, false), do: :tls, else: :tcp
+
+    connection_opts = [
+      transport: transport,
+      host: host,
+      port: port,
+      username: Keyword.get(opts, :username),
+      password: Keyword.get(opts, :password),
+      tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
+      tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
+      tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
+      tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
+      tls_server_name: Keyword.get(opts, :tls_server_name),
+      tls_insecure: Keyword.get(opts, :tls_insecure, false)
+    ]
+
+    {:ok, Connection.new(connection_opts)}
+  rescue
+    error in ArgumentError -> {:error, {:invalid_connection, Exception.message(error)}}
+  end
+
+  defp sentinel_connection(opts, port) do
+    {:ok, connection} = build_connection(Map.to_list(opts), opts.control_host, port)
+    connection
+  end
+
+  defp reject_unix_transport(opts) do
+    if Keyword.get(opts, :unixsocket) || Keyword.get(opts, :transport) == :unix do
+      {:error, {:unsupported_transport, :sentinel, :unix}}
+    else
+      :ok
+    end
+  end
+
+  defp validate_server_connection_config(node_opts, port) do
+    _config =
+      Config.new(
+        connection_server_opts(node_opts, port) ++
+          [bind: node_opts.bind, control_host: node_opts.control_host]
+      )
+
+    :ok
+  rescue
+    error in ArgumentError ->
+      {:error, {:invalid_connection_config, Exception.message(error)}}
   end
 
   defp read_pidfile(path) do

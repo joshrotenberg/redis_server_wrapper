@@ -28,6 +28,13 @@ defmodule RedisServerWrapper.Cluster do
     * `:control_host` - address used by redis-cli and cluster announcements
       (default: first bind address)
     * `:password` - Redis password (default: nil)
+    * `:username` - optional ACL username paired with `:password`
+    * `:tls` - use TLS-only cluster node connections (default: false)
+    * `:tls_cert_file`, `:tls_key_file` - server certificate and private key
+    * `:tls_ca_cert_file` or `:tls_ca_cert_dir` - trusted CA for Redis and redis-cli
+    * `:tls_client_cert_file`, `:tls_client_key_file` - optional redis-cli client identity
+    * `:tls_server_name` - optional redis-cli SNI name
+    * `:tls_insecure` - explicitly disable redis-cli certificate verification
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
@@ -43,7 +50,7 @@ defmodule RedisServerWrapper.Cluster do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, Server}
+  alias RedisServerWrapper.{Cli, Config, Connection, Server}
 
   require Logger
 
@@ -53,6 +60,8 @@ defmodule RedisServerWrapper.Cluster do
     :base_port,
     :bind,
     :control_host,
+    :connection,
+    :username,
     :password,
     :redis_cli_bin,
     node_pids: [],
@@ -129,6 +138,7 @@ defmodule RedisServerWrapper.Cluster do
       |> Config.control_host()
 
     password = Keyword.get(opts, :password)
+    username = Keyword.get(opts, :username)
     distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
@@ -137,7 +147,10 @@ defmodule RedisServerWrapper.Cluster do
     extra = Keyword.get(opts, :extra, [])
     managed = Keyword.get(opts, :managed, true)
 
-    with :ok <- Server.validate_distribution(distribution),
+    with :ok <- valid_port(:base_port, base_port),
+         :ok <- reject_unix_transport(opts),
+         {:ok, connection} <- build_connection(opts, control_host, base_port),
+         :ok <- Server.validate_distribution(distribution),
          redis_server_bin =
            Keyword.get_lazy(opts, :redis_server_bin, fn ->
              Server.default_server_bin(distribution)
@@ -148,7 +161,19 @@ defmodule RedisServerWrapper.Cluster do
            base_port: base_port,
            bind: bind,
            control_host: control_host,
+           connection: connection,
+           username: username,
            password: password,
+           tls: connection.transport == :tls,
+           tls_cert_file: Keyword.get(opts, :tls_cert_file),
+           tls_key_file: Keyword.get(opts, :tls_key_file),
+           tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
+           tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
+           tls_auth_clients: Keyword.get(opts, :tls_auth_clients),
+           tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
+           tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
+           tls_server_name: Keyword.get(opts, :tls_server_name),
+           tls_insecure: Keyword.get(opts, :tls_insecure, false),
            distribution: distribution,
            redis_server_bin: redis_server_bin,
            redis_cli_bin: redis_cli_bin,
@@ -158,6 +183,7 @@ defmodule RedisServerWrapper.Cluster do
            extra: extra,
            managed: managed
          },
+         :ok <- validate_server_connection_config(settings),
          :ok <- validate_options(settings) do
       start_validated_cluster(settings)
     else
@@ -173,8 +199,8 @@ defmodule RedisServerWrapper.Cluster do
   def handle_call(:node_addrs, _from, state) do
     addrs =
       Enum.map(state.node_pids, fn pid ->
-        info = Server.info(pid)
-        format_addr(info.host, info.port)
+        connection = Server.info(pid).connection
+        format_addr(connection.host, connection.port)
       end)
 
     {:reply, addrs, state}
@@ -212,11 +238,12 @@ defmodule RedisServerWrapper.Cluster do
       base_port: state.base_port,
       bind: state.bind,
       control_host: state.control_host,
+      connection: state.connection,
       total_nodes: length(state.node_pids),
       node_addrs:
         Enum.map(state.node_pids, fn pid ->
-          node_info = Server.info(pid)
-          format_addr(node_info.host, node_info.port)
+          connection = Server.info(pid).connection
+          format_addr(connection.host, connection.port)
         end)
     }
 
@@ -272,7 +299,19 @@ defmodule RedisServerWrapper.Cluster do
       Map.take(settings, [
         :bind,
         :control_host,
+        :connection,
+        :username,
         :password,
+        :tls,
+        :tls_cert_file,
+        :tls_key_file,
+        :tls_ca_cert_file,
+        :tls_ca_cert_dir,
+        :tls_auth_clients,
+        :tls_client_cert_file,
+        :tls_client_key_file,
+        :tls_server_name,
+        :tls_insecure,
         :distribution,
         :redis_server_bin,
         :redis_cli_bin,
@@ -292,13 +331,7 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   defp form_cluster(node_pids, ports, settings) do
-    seed_cli =
-      Cli.new(
-        bin: settings.redis_cli_bin,
-        host: settings.control_host,
-        port: settings.base_port,
-        password: settings.password
-      )
+    seed_cli = node_pids |> List.first() |> Server.cli()
 
     node_addr_list = Enum.map(ports, &format_addr(settings.control_host, &1))
 
@@ -313,6 +346,8 @@ defmodule RedisServerWrapper.Cluster do
           base_port: settings.base_port,
           bind: settings.bind,
           control_host: settings.control_host,
+          connection: settings.connection,
+          username: settings.username,
           password: settings.password,
           redis_cli_bin: settings.redis_cli_bin,
           node_pids: node_pids
@@ -331,22 +366,22 @@ defmodule RedisServerWrapper.Cluster do
     results =
       Enum.reduce_while(ports, {:ok, []}, fn port, {:ok, acc} ->
         opts =
-          [
-            port: port,
-            bind: node_opts.bind,
-            control_host: node_opts.control_host,
-            password: node_opts.password,
-            distribution: node_opts.distribution,
-            redis_server_bin: node_opts.redis_server_bin,
-            redis_cli_bin: node_opts.redis_cli_bin,
-            timeout: node_opts.timeout,
-            managed: node_opts.managed,
-            cluster_enabled: true,
-            cluster_config_file: "nodes-#{port}.conf",
-            cluster_node_timeout: node_opts.cluster_node_timeout,
-            loadmodule: node_opts.loadmodule,
-            save: :disabled
-          ] ++ extra_to_opts(node_opts.extra)
+          connection_server_opts(node_opts, port) ++
+            [
+              bind: node_opts.bind,
+              control_host: node_opts.control_host,
+              distribution: node_opts.distribution,
+              redis_server_bin: node_opts.redis_server_bin,
+              redis_cli_bin: node_opts.redis_cli_bin,
+              timeout: node_opts.timeout,
+              managed: node_opts.managed,
+              cluster_enabled: true,
+              cluster_config_file: "nodes-#{port}.conf",
+              cluster_node_timeout: node_opts.cluster_node_timeout,
+              cluster_announce_port: port,
+              loadmodule: node_opts.loadmodule,
+              save: :disabled
+            ] ++ extra_to_opts(node_opts.extra)
 
         case Server.start_link(opts) do
           {:ok, pid} ->
@@ -365,10 +400,78 @@ defmodule RedisServerWrapper.Cluster do
   defp seed_cli(state) do
     Cli.new(
       bin: state.redis_cli_bin,
-      host: state.control_host,
-      port: state.base_port,
-      password: state.password
+      connection: state.connection
     )
+  end
+
+  defp connection_server_opts(%{tls: false} = opts, port) do
+    [
+      port: port,
+      username: opts.username,
+      password: opts.password
+    ]
+  end
+
+  defp connection_server_opts(%{tls: true} = opts, port) do
+    [
+      port: 0,
+      tls_port: port,
+      username: opts.username,
+      password: opts.password,
+      tls_cert_file: opts.tls_cert_file,
+      tls_key_file: opts.tls_key_file,
+      tls_ca_cert_file: opts.tls_ca_cert_file,
+      tls_ca_cert_dir: opts.tls_ca_cert_dir,
+      tls_auth_clients: opts.tls_auth_clients,
+      tls_client_cert_file: opts.tls_client_cert_file,
+      tls_client_key_file: opts.tls_client_key_file,
+      tls_server_name: opts.tls_server_name,
+      tls_insecure: opts.tls_insecure,
+      tls_cluster: true
+    ]
+  end
+
+  defp build_connection(opts, host, port) do
+    transport = if Keyword.get(opts, :tls, false), do: :tls, else: :tcp
+
+    connection_opts = [
+      transport: transport,
+      host: host,
+      port: port,
+      username: Keyword.get(opts, :username),
+      password: Keyword.get(opts, :password),
+      tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
+      tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
+      tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
+      tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
+      tls_server_name: Keyword.get(opts, :tls_server_name),
+      tls_insecure: Keyword.get(opts, :tls_insecure, false)
+    ]
+
+    {:ok, Connection.new(connection_opts)}
+  rescue
+    error in ArgumentError -> {:error, {:invalid_connection, Exception.message(error)}}
+  end
+
+  defp reject_unix_transport(opts) do
+    if Keyword.get(opts, :unixsocket) || Keyword.get(opts, :transport) == :unix do
+      {:error, {:unsupported_transport, :cluster, :unix}}
+    else
+      :ok
+    end
+  end
+
+  defp validate_server_connection_config(settings) do
+    _config =
+      Config.new(
+        connection_server_opts(settings, settings.base_port) ++
+          [bind: settings.bind, control_host: settings.control_host]
+      )
+
+    :ok
+  rescue
+    error in ArgumentError ->
+      {:error, {:invalid_connection_config, Exception.message(error)}}
   end
 
   defp extra_to_opts([]), do: []

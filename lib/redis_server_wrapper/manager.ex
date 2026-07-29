@@ -22,11 +22,27 @@ defmodule RedisServerWrapper.Manager do
   the same state file concurrently.
   """
 
-  alias RedisServerWrapper.{Cli, Cluster, OSProcess, SecureFile, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, Connection, OSProcess, SecureFile, Sentinel, Server}
 
   require Logger
 
   @default_state_file Path.expand("~/.config/redis-server-wrapper/instances.json")
+  @connection_option_keys [
+    :username,
+    :unixsocket,
+    :unixsocketperm,
+    :tls,
+    :tls_port,
+    :tls_cert_file,
+    :tls_key_file,
+    :tls_ca_cert_file,
+    :tls_ca_cert_dir,
+    :tls_auth_clients,
+    :tls_client_cert_file,
+    :tls_client_key_file,
+    :tls_server_name,
+    :tls_insecure
+  ]
 
   @type instance_type :: :basic | :cluster | :sentinel
   @type instance :: %{
@@ -36,7 +52,9 @@ defmodule RedisServerWrapper.Manager do
           bind: String.t(),
           ports: [non_neg_integer()],
           pids: [non_neg_integer()],
+          username: String.t() | nil,
           password: String.t() | nil,
+          connection: Connection.t(),
           url: String.t(),
           metadata: map()
         }
@@ -53,12 +71,14 @@ defmodule RedisServerWrapper.Manager do
     * `:name` - instance name (auto-generated if omitted)
     * `:port` - Redis port (default: 6379)
     * `:password` - Redis password (auto-generated if omitted, pass `nil` for no auth)
+    * `:username` - optional ACL username paired with `:password`
     * `:bind` - bind address (default: "127.0.0.1")
     * `:control_host` - address used for client and lifecycle operations
     * `:persist` - enable persistence (default: false)
     * `:maxmemory` - memory limit (e.g., "256mb")
     * `:loadmodule` - modules to load; accepts paths or `{path, [args]}` tuples
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
+    * TCP, Unix-socket, and TLS options accepted by `RedisServerWrapper.Server`
     * Plus any `RedisServerWrapper.Config` options via `:extra`
   """
   @spec start_basic(keyword()) :: {:ok, instance()} | {:error, term()}
@@ -93,7 +113,10 @@ defmodule RedisServerWrapper.Manager do
           managed: false,
           distribution: distribution,
           loadmodule: loadmodule
-        ]
+        ] ++ server_connection_options(opts)
+
+      server_opts =
+        server_opts
         |> maybe_put(:maxmemory, maxmemory)
         |> maybe_put(:extra, if(extra != [], do: extra))
 
@@ -107,11 +130,13 @@ defmodule RedisServerWrapper.Manager do
             name: name,
             type: :basic,
             created_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-            bind: info.host,
-            ports: [port],
+            bind: info.connection.host || info.host,
+            ports: connection_ports(info.connection),
             pids: [info.pid],
+            username: info.connection.username,
             password: password,
-            url: build_url(info.host, port, password),
+            connection: info.connection,
+            url: Connection.url(info.connection),
             metadata: %{
               persist: persist,
               maxmemory: maxmemory,
@@ -139,10 +164,12 @@ defmodule RedisServerWrapper.Manager do
     * `:replicas_per_master` - replicas per master (default: 0)
     * `:base_port` - starting port (default: 7100)
     * `:password` - Redis password (auto-generated if omitted)
+    * `:username` - optional ACL username paired with `:password`
     * `:bind` - bind address (default: "127.0.0.1")
     * `:control_host` - address used for client and cluster operations
     * `:loadmodule` - modules loaded into every cluster node
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
+    * TLS options accepted by `RedisServerWrapper.Cluster`
   """
   @spec start_cluster(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_cluster(opts \\ []) do
@@ -164,17 +191,18 @@ defmodule RedisServerWrapper.Manager do
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
     else
-      cluster_opts = [
-        masters: masters,
-        replicas_per_master: replicas,
-        base_port: base_port,
-        bind: bind,
-        control_host: control_host,
-        password: password,
-        managed: false,
-        distribution: distribution,
-        loadmodule: loadmodule
-      ]
+      cluster_opts =
+        [
+          masters: masters,
+          replicas_per_master: replicas,
+          base_port: base_port,
+          bind: bind,
+          control_host: control_host,
+          password: password,
+          managed: false,
+          distribution: distribution,
+          loadmodule: loadmodule
+        ] ++ connection_options(opts)
 
       case Cluster.start(cluster_opts) do
         {:ok, pid} ->
@@ -197,8 +225,10 @@ defmodule RedisServerWrapper.Manager do
             bind: cluster_info.control_host,
             ports: ports,
             pids: os_pids,
+            username: cluster_info.connection.username,
             password: password,
-            url: build_url(cluster_info.control_host, base_port, password),
+            connection: cluster_info.connection,
+            url: Connection.url(cluster_info.connection),
             metadata: %{
               masters: masters,
               replicas_per_master: replicas
@@ -227,9 +257,11 @@ defmodule RedisServerWrapper.Manager do
     * `:quorum` - Sentinel quorum (default: min(2, sentinels))
     * `:sentinel_base_port` - starting sentinel port (default: 26389)
     * `:password` - Redis password (auto-generated if omitted)
+    * `:username` - optional ACL username paired with `:password`
     * `:bind` - bind address (default: "127.0.0.1")
     * `:loadmodule` - modules loaded into the master and every replica
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
+    * TLS options accepted by `RedisServerWrapper.Sentinel`
   """
   @spec start_sentinel(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_sentinel(opts \\ []) do
@@ -253,19 +285,20 @@ defmodule RedisServerWrapper.Manager do
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
     else
-      sentinel_opts = [
-        master_port: master_port,
-        replicas: num_replicas,
-        sentinels: num_sentinels,
-        quorum: quorum,
-        sentinel_base_port: sentinel_base_port,
-        bind: bind,
-        control_host: control_host,
-        password: password,
-        managed: false,
-        distribution: distribution,
-        loadmodule: loadmodule
-      ]
+      sentinel_opts =
+        [
+          master_port: master_port,
+          replicas: num_replicas,
+          sentinels: num_sentinels,
+          quorum: quorum,
+          sentinel_base_port: sentinel_base_port,
+          bind: bind,
+          control_host: control_host,
+          password: password,
+          managed: false,
+          distribution: distribution,
+          loadmodule: loadmodule
+        ] ++ connection_options(opts)
 
       case Sentinel.start(sentinel_opts) do
         {:ok, pid} ->
@@ -301,8 +334,10 @@ defmodule RedisServerWrapper.Manager do
             bind: sen_info.control_host,
             ports: all_redis_ports ++ sentinel_ports,
             pids: redis_pids ++ sentinel_pids,
+            username: sen_info.master_connection.username,
             password: password,
-            url: build_url(sen_info.control_host, master_port, password),
+            connection: sen_info.master_connection,
+            url: Connection.url(sen_info.master_connection),
             metadata: %{
               master_name: sen_info.master_name,
               master_port: master_port,
@@ -377,7 +412,8 @@ defmodule RedisServerWrapper.Manager do
   caller explicitly needs the plaintext password or connection URL.
   """
   @spec credentials(String.t()) ::
-          {:ok, %{password: String.t() | nil, url: String.t()}} | {:error, :not_found}
+          {:ok, %{username: String.t() | nil, password: String.t() | nil, url: String.t()}}
+          | {:error, :not_found}
   def credentials(name) do
     state = load_state()
 
@@ -388,8 +424,9 @@ defmodule RedisServerWrapper.Manager do
       instance ->
         {:ok,
          %{
+           username: instance_connection(instance).username,
            password: instance.password,
-           url: build_url(instance.bind, List.first(instance.ports), instance.password)
+           url: Connection.url(instance_connection(instance))
          }}
     end
   end
@@ -609,6 +646,8 @@ defmodule RedisServerWrapper.Manager do
   defp deserialize_state(_data), do: raise(ArgumentError, "Manager state must be an object")
 
   defp deserialize_instance(name, inst) when is_map(inst) do
+    connection = deserialize_connection(inst)
+
     %{
       name: inst["name"] || name,
       type: deserialize_type(inst["type"] || "basic"),
@@ -616,7 +655,9 @@ defmodule RedisServerWrapper.Manager do
       bind: inst["bind"] || "127.0.0.1",
       ports: inst["ports"] || [],
       pids: inst["pids"] || [],
+      username: inst["username"] || connection.username,
       password: inst["password"],
+      connection: connection,
       url: inst["url"] || "",
       metadata: atomize_keys(inst["metadata"] || %{})
     }
@@ -629,6 +670,25 @@ defmodule RedisServerWrapper.Manager do
   defp deserialize_type("cluster"), do: :cluster
   defp deserialize_type("sentinel"), do: :sentinel
   defp deserialize_type(type), do: raise(ArgumentError, "unknown Manager instance type: #{type}")
+
+  defp deserialize_connection(%{"connection" => connection}) when is_map(connection) do
+    Connection.from_map(connection)
+  end
+
+  defp deserialize_connection(instance) do
+    port =
+      case instance["ports"] || [] do
+        [port | _rest] when is_integer(port) and port > 0 -> port
+        _other -> 6379
+      end
+
+    Connection.new(
+      host: instance["bind"] || "127.0.0.1",
+      port: port,
+      username: instance["username"],
+      password: instance["password"]
+    )
+  end
 
   defp atomize_keys(map) when is_map(map) do
     Map.new(map, fn
@@ -737,31 +797,60 @@ defmodule RedisServerWrapper.Manager do
 
   defp owned_listeners(instance) do
     Enum.reduce_while(
-      instance.ports,
+      listener_targets(instance),
       {:ok, %{}},
       &collect_owned_listener(&1, &2, instance)
     )
   end
 
-  defp collect_owned_listener(port, {:ok, listeners}, instance) do
-    case OSProcess.pids_on_port(port) do
-      {:ok, port_pids} ->
-        owned_pids = Enum.filter(port_pids, &(&1 in instance.pids))
-        {:cont, {:ok, maybe_put_listener(listeners, port, owned_pids)}}
+  defp collect_owned_listener(target, {:ok, listeners}, instance) do
+    case pids_on_target(target) do
+      {:ok, target_pids} ->
+        owned_pids = Enum.filter(target_pids, &(&1 in instance.pids))
+        {:cont, {:ok, maybe_put_listener(listeners, target, owned_pids)}}
 
       {:error, reason} ->
         {:halt, {:error, {:process_ownership_not_verified, instance.name, reason}}}
     end
   end
 
-  defp maybe_put_listener(listeners, _port, []), do: listeners
-  defp maybe_put_listener(listeners, port, pids), do: Map.put(listeners, port, pids)
+  defp maybe_put_listener(listeners, _target, []), do: listeners
+  defp maybe_put_listener(listeners, target, pids), do: Map.put(listeners, target, pids)
 
   defp gracefully_stop_owned_listeners(instance, listeners) do
-    Enum.each(Map.keys(listeners), fn port ->
-      cli = Cli.new(host: instance.bind, port: port, password: instance.password)
+    Enum.each(Map.keys(listeners), fn target ->
+      cli = Cli.new(connection: connection_for_target(instance, target))
       _result = Cli.run(cli, ["SHUTDOWN", "NOSAVE"])
     end)
+  end
+
+  defp listener_targets(instance) do
+    case instance_connection(instance) do
+      %Connection{transport: :unix, socket: socket} -> [{:unix, socket}]
+      _connection -> Enum.map(instance.ports, &{:tcp, &1})
+    end
+  end
+
+  defp pids_on_target({:tcp, port}), do: OSProcess.pids_on_port(port)
+  defp pids_on_target({:unix, socket}), do: OSProcess.pids_on_socket(socket)
+
+  defp connection_for_target(instance, {:tcp, port}) do
+    instance |> instance_connection() |> Connection.with_port(port)
+  end
+
+  defp connection_for_target(instance, {:unix, _socket}), do: instance_connection(instance)
+
+  defp instance_connection(%{connection: %Connection{} = connection}), do: connection
+
+  defp instance_connection(instance) do
+    port = Enum.find(instance.ports, 6379, &(&1 > 0))
+
+    Connection.new(
+      host: instance.bind,
+      port: port,
+      username: Map.get(instance, :username),
+      password: instance.password
+    )
   end
 
   defp signal_owned_listeners(instance, signal) do
@@ -820,24 +909,8 @@ defmodule RedisServerWrapper.Manager do
   defp ports_from(_base_port, 0), do: []
   defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
 
-  # -------------------------------------------------------------------
-  # URL building
-  # -------------------------------------------------------------------
-
-  defp build_url(host, port, nil), do: "redis://#{url_host(host)}:#{port}"
-
-  defp build_url(host, port, password) do
-    encoded_password = URI.encode(password, &URI.char_unreserved?/1)
-    "redis://:#{encoded_password}@#{url_host(host)}:#{port}"
-  end
-
-  defp url_host(host) do
-    if String.contains?(host, ":") and not String.starts_with?(host, "[") do
-      "[#{host}]"
-    else
-      host
-    end
-  end
+  defp connection_ports(%Connection{transport: :unix}), do: []
+  defp connection_ports(%Connection{port: port}), do: [port]
 
   # -------------------------------------------------------------------
   # Display helpers
@@ -897,4 +970,12 @@ defmodule RedisServerWrapper.Manager do
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp connection_options(opts), do: Keyword.take(opts, @connection_option_keys)
+
+  defp server_connection_options(opts) do
+    opts
+    |> connection_options()
+    |> Keyword.delete(:tls)
+  end
 end
