@@ -179,6 +179,28 @@ instead of being overwritten.
 - `managed: false` - `redis-server` daemonizes independently; the caller owns the
   OS process lifecycle.
 
+If a managed Redis process exits unexpectedly, its `Server` GenServer now exits
+with an abnormal `{:redis_server_exit, backend, reason}` reason. A normal OTP
+supervisor therefore restarts the complete Server child instead of retaining a
+live GenServer with a missing OS process. Port and Forcola backends follow the
+same contract.
+
+Cluster and Sentinel make topology loss explicit:
+
+- Cluster removes a dead node from `Cluster.nodes/1`, stays available for chaos
+  and failover work, and reports both `all_alive?/1` and `healthy?/1` as false.
+  `healthy?/1` validates every remaining node's state, slot coverage, failure
+  counts, known-node count, and master count.
+- Sentinel uses the selected managed backend for its control processes as well
+  as its data nodes. Loss of a master, replica, or Sentinel control process
+  stops the topology abnormally after cleaning up the remaining children, so a
+  supervisor can restart the complete topology from a coherent state.
+
+Cluster formation, replica linkage, and Sentinel discovery use bounded polling
+instead of fixed startup sleeps. Set `convergence_timeout: milliseconds` to
+override the default (the value of `:timeout`). Timeout errors include the last
+observed health state to make transitional or malformed Redis output diagnosable.
+
 ### Custom Modules
 
 Use `:loadmodule` to load one or more Redis modules. A plain path is enough for

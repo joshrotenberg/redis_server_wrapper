@@ -36,17 +36,18 @@ defmodule RedisServerWrapper.ChaosTest do
 
   describe "kill_node/1" do
     test "kills the redis-server OS process" do
-      {:ok, server} = Server.start_link(port: 6450)
+      {:ok, server} = Server.start(port: 6450)
       assert Server.ping(server)
 
       %{pid: os_pid} = Server.info(server)
+      monitor = Process.monitor(server)
       Chaos.kill_node(server)
-      Process.sleep(500)
+
+      assert_receive {:DOWN, ^monitor, :process, ^server, {:redis_server_exit, :port, _}},
+                     5_000
 
       {_, code} = System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true)
       assert code != 0
-
-      Server.stop(server)
     end
   end
 
@@ -160,8 +161,7 @@ defmodule RedisServerWrapper.ChaosTest do
       {:ok, killed_pid} = Chaos.kill_master(cluster, "testkey")
       assert is_pid(killed_pid)
 
-      Process.sleep(500)
-      refute Server.alive?(killed_pid)
+      assert wait_until(fn -> not Process.alive?(killed_pid) end, 20, 100)
 
       Cluster.stop(cluster)
       Process.sleep(1000)
@@ -175,8 +175,7 @@ defmodule RedisServerWrapper.ChaosTest do
       {:ok, killed_pid} = Chaos.kill_master(cluster, 0)
       assert is_pid(killed_pid)
 
-      Process.sleep(500)
-      refute Server.alive?(killed_pid)
+      assert wait_until(fn -> not Process.alive?(killed_pid) end, 20, 100)
 
       Cluster.stop(cluster)
       Process.sleep(1000)
@@ -234,9 +233,8 @@ defmodule RedisServerWrapper.ChaosTest do
 
       {:ok, killed_pid} = Chaos.random_kill(cluster)
       assert is_pid(killed_pid)
-      Process.sleep(500)
 
-      refute Server.alive?(killed_pid)
+      assert wait_until(fn -> not Process.alive?(killed_pid) end, 20, 100)
 
       Cluster.stop(cluster)
       Process.sleep(1000)

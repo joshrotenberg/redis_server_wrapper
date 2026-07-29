@@ -40,24 +40,35 @@ defmodule RedisServerWrapper.Sentinel do
     * `:redis_cli_bin` - redis-cli binary path
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * `:timeout` - startup timeout per node in ms (default: 10_000)
+    * `:convergence_timeout` - bounded wait for replication and Sentinel
+      discovery (default: the value of `:timeout`)
     * `:loadmodule` - modules loaded into the master and every replica; accepts
       paths or `{path, [args]}` tuples (default: `[]`). Sentinel processes do
       not load data modules.
     * `:managed` - process lifecycle backend forwarded to the master and every
       replica. See `RedisServerWrapper.Server` for `true`, `:forcola`, and
-      `false`. Only `managed: false` supports `detach/1`. Sentinel processes
-      always daemonize regardless of this flag.
+      `false`. Sentinel control processes use the same selected backend. Only
+      `managed: false` supports `detach/1`.
   """
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, Connection, OSProcess, SecureFile, Server}
+  alias RedisServerWrapper.{
+    Cli,
+    Config,
+    Connection,
+    ManagedProcess,
+    OSProcess,
+    SecureFile,
+    Server
+  }
 
   require Logger
 
   defstruct [
     :master_name,
     :master_port,
+    :replica_base_port,
     :bind,
     :control_host,
     :master_connection,
@@ -65,11 +76,13 @@ defmodule RedisServerWrapper.Sentinel do
     :username,
     :password,
     :redis_cli_bin,
+    :managed,
     :master_pid,
     :num_replicas,
     :num_sentinels,
     replica_pids: [],
     sentinel_os_pids: [],
+    sentinel_processes: [],
     sentinel_ports: [],
     sentinel_dir: nil,
     detached: false
@@ -154,6 +167,7 @@ defmodule RedisServerWrapper.Sentinel do
     distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
+    convergence_timeout = Keyword.get(opts, :convergence_timeout, timeout)
     loadmodule = Keyword.get(opts, :loadmodule, [])
     managed = Keyword.get(opts, :managed, true)
 
@@ -165,9 +179,19 @@ defmodule RedisServerWrapper.Sentinel do
            Keyword.get_lazy(opts, :redis_server_bin, fn ->
              Server.default_server_bin(distribution)
            end),
-         node_opts = %{
+         settings = %{
+           master_name: master_name,
+           master_port: master_port,
+           replicas: num_replicas,
+           replica_base_port: replica_base_port,
+           sentinels: num_sentinels,
+           sentinel_base_port: sentinel_base_port,
+           quorum: quorum,
+           down_after_ms: down_after_ms,
+           failover_timeout_ms: failover_timeout_ms,
            bind: bind,
            control_host: control_host,
+           master_connection: master_connection,
            username: username,
            password: password,
            tls: master_connection.transport == :tls,
@@ -184,80 +208,14 @@ defmodule RedisServerWrapper.Sentinel do
            redis_server_bin: redis_server_bin,
            redis_cli_bin: redis_cli_bin,
            timeout: timeout,
+           convergence_timeout: convergence_timeout,
            loadmodule: loadmodule,
            managed: managed
          },
-         validation_settings = %{
-           master_port: master_port,
-           replicas: num_replicas,
-           replica_base_port: replica_base_port,
-           sentinels: num_sentinels,
-           sentinel_base_port: sentinel_base_port,
-           quorum: quorum,
-           down_after_ms: down_after_ms,
-           failover_timeout_ms: failover_timeout_ms,
-           timeout: timeout
-         },
-         :ok <- validate_server_connection_config(node_opts, master_port),
-         :ok <- validate_options(validation_settings),
-         {:ok, master_pid} <- start_master(master_port, node_opts),
-         {:ok, replica_pids} <-
-           start_replicas(num_replicas, replica_base_port, master_port, node_opts),
-         # Let replication link up
-         _ <- Process.sleep(1000),
-         {:ok, sentinel_os_pids, sentinel_dir} <-
-           start_sentinels(%{
-             count: num_sentinels,
-             base_port: sentinel_base_port,
-             master_name: master_name,
-             master_port: master_port,
-             bind: bind,
-             control_host: control_host,
-             username: username,
-             password: password,
-             tls: master_connection.transport == :tls,
-             tls_cert_file: Keyword.get(opts, :tls_cert_file),
-             tls_key_file: Keyword.get(opts, :tls_key_file),
-             tls_ca_cert_file: Keyword.get(opts, :tls_ca_cert_file),
-             tls_ca_cert_dir: Keyword.get(opts, :tls_ca_cert_dir),
-             tls_auth_clients: Keyword.get(opts, :tls_auth_clients),
-             tls_client_cert_file: Keyword.get(opts, :tls_client_cert_file),
-             tls_client_key_file: Keyword.get(opts, :tls_client_key_file),
-             tls_server_name: Keyword.get(opts, :tls_server_name),
-             tls_insecure: Keyword.get(opts, :tls_insecure, false),
-             quorum: quorum,
-             down_after_ms: down_after_ms,
-             failover_timeout_ms: failover_timeout_ms,
-             redis_server_bin: redis_server_bin,
-             redis_cli_bin: redis_cli_bin,
-             timeout: timeout
-           }) do
-      # Wait for sentinel discovery
-      Process.sleep(2000)
-
-      sentinel_ports = ports_from(sentinel_base_port, num_sentinels)
-      sentinel_connection = Connection.with_port(master_connection, sentinel_base_port)
-
-      state = %__MODULE__{
-        master_name: master_name,
-        master_port: master_port,
-        bind: bind,
-        control_host: control_host,
-        master_connection: master_connection,
-        sentinel_connection: sentinel_connection,
-        username: username,
-        password: password,
-        redis_cli_bin: redis_cli_bin,
-        master_pid: master_pid,
-        num_replicas: num_replicas,
-        num_sentinels: num_sentinels,
-        replica_pids: replica_pids,
-        sentinel_os_pids: sentinel_os_pids,
-        sentinel_ports: sentinel_ports,
-        sentinel_dir: sentinel_dir
-      }
-
-      {:ok, state}
+         :ok <- validate_server_connection_config(settings, master_port),
+         :ok <- validate_options(settings),
+         :ok <- check_sentinel_endpoints(settings) do
+      start_validated_sentinel(settings)
     else
       {:error, reason} ->
         {:stop, reason}
@@ -284,6 +242,7 @@ defmodule RedisServerWrapper.Sentinel do
       master_addr: format_addr(state.control_host, state.master_port),
       replicas: state.num_replicas,
       sentinels: state.num_sentinels,
+      managed: state.managed,
       sentinel_addrs: Enum.map(state.sentinel_ports, &format_addr(state.control_host, &1))
     }
 
@@ -291,28 +250,7 @@ defmodule RedisServerWrapper.Sentinel do
   end
 
   def handle_call(:healthy?, _from, state) do
-    result =
-      Enum.any?(state.sentinel_ports, fn port ->
-        cli =
-          Cli.new(
-            bin: state.redis_cli_bin,
-            connection: Connection.with_port(state.sentinel_connection, port)
-          )
-
-        case Cli.sentinel_master(cli, state.master_name) do
-          {:ok, info} ->
-            flags = Map.get(info, "flags", "")
-            num_slaves = String.to_integer(Map.get(info, "num-slaves", "0"))
-            num_sentinels = String.to_integer(Map.get(info, "num-other-sentinels", "0")) + 1
-
-            flags == "master" &&
-              num_slaves >= state.num_replicas &&
-              num_sentinels >= state.num_sentinels
-
-          _ ->
-            false
-        end
-      end)
+    result = match?({:ok, _snapshot}, sentinel_health(state))
 
     {:reply, result, state}
   end
@@ -344,37 +282,48 @@ defmodule RedisServerWrapper.Sentinel do
 
   @impl true
   def handle_info({:EXIT, pid, reason}, state) do
-    if reason != :normal do
-      Logger.warning("Sentinel topology process #{inspect(pid)} exited: #{inspect(reason)}")
-    end
+    cond do
+      pid == state.master_pid ->
+        stop_reason = {:sentinel_data_node_exit, :master, state.master_port, reason}
+        Logger.warning("Sentinel master exited: #{inspect(reason)}")
+        {:stop, stop_reason, %{state | master_pid: nil}}
 
-    {:noreply, state}
+      pid in state.replica_pids ->
+        index = Enum.find_index(state.replica_pids, &(&1 == pid))
+        port = replica_port(state, index)
+        stop_reason = {:sentinel_data_node_exit, :replica, port, reason}
+        Logger.warning("Sentinel replica on port #{port} exited: #{inspect(reason)}")
+        {:stop, stop_reason, %{state | replica_pids: List.delete(state.replica_pids, pid)}}
+
+      process = Enum.find(state.sentinel_processes, &(&1.owner == pid)) ->
+        stop_reason = {:sentinel_control_exit, process.port, reason}
+
+        Logger.warning(
+          "Sentinel control process on port #{process.port} exited: #{inspect(reason)}"
+        )
+
+        {:stop, stop_reason,
+         %{state | sentinel_processes: List.delete(state.sentinel_processes, process)}}
+
+      true ->
+        {:noreply, state}
+    end
   end
 
   @impl true
   def terminate(_reason, %{detached: true} = state) do
     Logger.debug("RedisServerWrapper.Sentinel terminating (OS processes detached)")
-    stop_servers(state.replica_pids ++ [state.master_pid])
+    stop_servers(state.replica_pids ++ List.wrap(state.master_pid))
     :ok
   end
 
   def terminate(_reason, state) do
     Logger.debug("RedisServerWrapper.Sentinel terminating, stopping topology")
 
-    # Stop sentinels first (they're raw OS processes, not GenServers)
-    Enum.each(state.sentinel_os_pids, fn pid ->
-      OSProcess.signal(pid, :term)
-    end)
-
-    Process.sleep(500)
-
-    # Force kill any remaining sentinel processes
-    Enum.each(state.sentinel_os_pids, fn pid ->
-      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :kill)
-    end)
+    stop_sentinel_processes(state.sentinel_processes)
 
     # Stop replicas, then master
-    stop_servers(state.replica_pids ++ [state.master_pid])
+    stop_servers(state.replica_pids ++ List.wrap(state.master_pid))
 
     # Clean up sentinel config directory
     if state.sentinel_dir, do: File.rm_rf(state.sentinel_dir)
@@ -385,6 +334,102 @@ defmodule RedisServerWrapper.Sentinel do
   # -------------------------------------------------------------------
   # Internal
   # -------------------------------------------------------------------
+
+  defp start_validated_sentinel(settings) do
+    case start_master(settings.master_port, settings) do
+      {:ok, master_pid} ->
+        start_validated_replicas(master_pid, settings)
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
+  defp start_validated_replicas(master_pid, settings) do
+    case start_replicas(
+           settings.replicas,
+           settings.replica_base_port,
+           settings.master_port,
+           settings
+         ) do
+      {:ok, replica_pids} ->
+        await_replication_and_start_sentinels(master_pid, replica_pids, settings)
+
+      {:error, reason} ->
+        stop_servers([master_pid])
+        {:stop, reason}
+    end
+  end
+
+  defp await_replication_and_start_sentinels(master_pid, replica_pids, settings) do
+    case await_replication(
+           replica_pids,
+           settings.control_host,
+           settings.master_port,
+           settings.convergence_timeout
+         ) do
+      {:ok, _snapshot} ->
+        start_validated_sentinel_processes(master_pid, replica_pids, settings)
+
+      {:error, last_health} ->
+        stop_servers(replica_pids ++ [master_pid])
+
+        {:stop, {:replication_convergence_timeout, settings.convergence_timeout, last_health}}
+    end
+  end
+
+  defp start_validated_sentinel_processes(master_pid, replica_pids, settings) do
+    case start_sentinels(settings) do
+      {:ok, sentinel_processes, sentinel_dir} ->
+        state =
+          sentinel_state(master_pid, replica_pids, sentinel_processes, sentinel_dir, settings)
+
+        case await_sentinel_convergence(state, settings.convergence_timeout) do
+          {:ok, _snapshot} ->
+            {:ok, state}
+
+          {:error, last_health} ->
+            stop_sentinel_processes(sentinel_processes)
+            stop_servers(replica_pids ++ [master_pid])
+            File.rm_rf(sentinel_dir)
+
+            {:stop, {:sentinel_convergence_timeout, settings.convergence_timeout, last_health}}
+        end
+
+      {:error, reason} ->
+        stop_servers(replica_pids ++ [master_pid])
+        {:stop, reason}
+    end
+  end
+
+  defp sentinel_state(master_pid, replica_pids, sentinel_processes, sentinel_dir, settings) do
+    sentinel_ports = ports_from(settings.sentinel_base_port, settings.sentinels)
+
+    sentinel_connection =
+      Connection.with_port(settings.master_connection, settings.sentinel_base_port)
+
+    %__MODULE__{
+      master_name: settings.master_name,
+      master_port: settings.master_port,
+      replica_base_port: settings.replica_base_port,
+      bind: settings.bind,
+      control_host: settings.control_host,
+      master_connection: settings.master_connection,
+      sentinel_connection: sentinel_connection,
+      username: settings.username,
+      password: settings.password,
+      redis_cli_bin: settings.redis_cli_bin,
+      managed: settings.managed,
+      master_pid: master_pid,
+      num_replicas: settings.replicas,
+      num_sentinels: settings.sentinels,
+      replica_pids: replica_pids,
+      sentinel_os_pids: Enum.flat_map(sentinel_processes, &List.wrap(&1.os_pid)),
+      sentinel_processes: sentinel_processes,
+      sentinel_ports: sentinel_ports,
+      sentinel_dir: sentinel_dir
+    }
+  end
 
   defp start_master(port, node_opts) do
     Server.start_link(
@@ -432,7 +477,7 @@ defmodule RedisServerWrapper.Sentinel do
             {:cont, {:ok, acc ++ [pid]}}
 
           {:error, reason} ->
-            Enum.each(acc, &Server.stop/1)
+            stop_servers(acc)
             {:halt, {:error, {:replica_start_failed, port, reason}}}
         end
       end)
@@ -441,7 +486,8 @@ defmodule RedisServerWrapper.Sentinel do
   end
 
   defp start_sentinels(opts) do
-    %{count: count, base_port: base_port} = opts
+    count = opts.sentinels
+    base_port = opts.sentinel_base_port
 
     sentinel_dir =
       Path.join([
@@ -457,17 +503,18 @@ defmodule RedisServerWrapper.Sentinel do
         port = base_port + i
 
         case start_single_sentinel(opts, sentinel_dir, port) do
-          {:ok, os_pid} ->
-            {:cont, {:ok, acc ++ [os_pid]}}
+          {:ok, process} ->
+            {:cont, {:ok, acc ++ [process]}}
 
           {:error, reason} ->
-            kill_pids(acc)
+            stop_sentinel_processes(acc)
+            File.rm_rf(sentinel_dir)
             {:halt, {:error, {:sentinel_start_failed, port, reason}}}
         end
       end)
 
     case results do
-      {:ok, pids} -> {:ok, pids, sentinel_dir}
+      {:ok, processes} -> {:ok, processes, sentinel_dir}
       error -> error
     end
   end
@@ -486,7 +533,8 @@ defmodule RedisServerWrapper.Sentinel do
       node_dir,
       opts.redis_cli_bin,
       sentinel_connection(opts, port),
-      opts.timeout
+      opts.timeout,
+      opts.managed
     )
   end
 
@@ -510,7 +558,7 @@ defmodule RedisServerWrapper.Sentinel do
       [
         Config.directive("port", [if(tls, do: 0, else: port)]),
         Config.directive("bind", listen_addresses),
-        Config.directive("daemonize", ["yes"]),
+        Config.directive("daemonize", [if(opts.managed == false, do: "yes", else: "no")]),
         Config.directive("pidfile", [Path.join(dir, "sentinel.pid")]),
         Config.directive("logfile", [Path.join(dir, "sentinel.log")]),
         Config.directive("dir", [dir]),
@@ -558,19 +606,14 @@ defmodule RedisServerWrapper.Sentinel do
   defp optional_directive(_key, nil), do: []
   defp optional_directive(key, value), do: [Config.directive(key, [value])]
 
-  defp kill_pids(pids) do
-    Enum.each(pids, fn pid ->
-      OSProcess.signal(pid, :term)
-    end)
-  end
-
   defp start_sentinel_process(
          redis_server_bin,
          conf_path,
          node_dir,
          redis_cli_bin,
          connection,
-         timeout
+         timeout,
+         false
        ) do
     # Sentinel rewrites its configuration as topology state changes. Launch it
     # with a private umask so every replacement keeps credential-bearing config
@@ -586,24 +629,69 @@ defmodule RedisServerWrapper.Sentinel do
 
     case System.cmd("/bin/sh", command_args, stderr_to_stdout: true) do
       {_output, 0} ->
-        # Wait for sentinel to be ready
         cli = Cli.new(bin: redis_cli_bin, connection: connection)
 
         case Cli.wait_for_ready(cli, timeout) do
           :ok ->
             pid_path = Path.join(node_dir, "sentinel.pid")
             pid = read_pidfile(pid_path)
-            {:ok, pid}
+            {:ok, %{managed: false, owner: nil, os_pid: pid, port: connection.port}}
 
           {:error, :timeout} ->
+            kill_pid(read_pidfile(Path.join(node_dir, "sentinel.pid")))
             {:error, {:sentinel_start_timeout, connection.port}}
 
           {:error, {:unexpected_reply, reply}} ->
+            kill_pid(read_pidfile(Path.join(node_dir, "sentinel.pid")))
             {:error, {:sentinel_port_in_use, connection.port, reply}}
         end
 
       {output, code} ->
         {:error, {:sentinel_start_failed, connection.port, code, output}}
+    end
+  end
+
+  defp start_sentinel_process(
+         redis_server_bin,
+         conf_path,
+         node_dir,
+         redis_cli_bin,
+         connection,
+         timeout,
+         managed
+       )
+       when managed in [true, :forcola] do
+    command_args = [
+      "-c",
+      ~S(umask 077; exec "$@"),
+      "redis-server-wrapper",
+      redis_server_bin,
+      conf_path,
+      "--sentinel"
+    ]
+
+    cli = Cli.new(bin: redis_cli_bin, connection: connection)
+    pid_path = Path.join(node_dir, "sentinel.pid")
+
+    case ManagedProcess.start_link(
+           backend: managed,
+           argv: ["/bin/sh" | command_args],
+           ready: fn -> Cli.ping(cli) end,
+           ready_timeout_ms: timeout,
+           pid_path: pid_path,
+           label: "redis-sentinel on #{Connection.label(connection)}",
+           shutdown: fn -> Cli.shutdown(cli) end
+         ) do
+      {:ok, owner} ->
+        %{pid: os_pid} = ManagedProcess.info(owner)
+
+        {:ok, %{managed: managed, owner: owner, os_pid: os_pid, port: connection.port}}
+
+      {:error, {:managed_process_start_failed, _label, :ready_timeout}} ->
+        {:error, {:sentinel_start_timeout, connection.port}}
+
+      {:error, reason} ->
+        {:error, {:sentinel_start_failed, connection.port, reason}}
     end
   end
 
@@ -682,10 +770,267 @@ defmodule RedisServerWrapper.Sentinel do
       {:error, {:invalid_connection_config, Exception.message(error)}}
   end
 
+  defp await_replication(replica_pids, host, port, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_replication(replica_pids, host, port, deadline)
+  end
+
+  defp do_await_replication(replica_pids, host, port, deadline) do
+    case replication_health(replica_pids, host, port) do
+      {:ok, _snapshot} = healthy ->
+        healthy
+
+      {:error, _reason} = unhealthy ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          unhealthy
+        else
+          Process.sleep(100)
+          do_await_replication(replica_pids, host, port, deadline)
+        end
+    end
+  end
+
+  defp replication_health([], _host, _port), do: {:ok, []}
+
+  defp replication_health(replica_pids, host, port) do
+    replica_pids
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {replica, index}, {:ok, snapshots} ->
+      with {:ok, output} <- safe_server_run(replica, ["INFO", "replication"]),
+           info = parse_info(output),
+           :ok <- valid_replication_info(info, host, port) do
+        {:cont, {:ok, [info | snapshots]}}
+      else
+        {:error, reason} ->
+          {:halt, {:error, {:replica_health_failed, index, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, snapshots} -> {:ok, Enum.reverse(snapshots)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp valid_replication_info(info, host, port) do
+    invalid =
+      %{}
+      |> maybe_invalid(
+        "role",
+        Map.get(info, "role") in ["slave", "replica"],
+        Map.get(info, "role")
+      )
+      |> maybe_invalid(
+        "master_link_status",
+        Map.get(info, "master_link_status") == "up",
+        Map.get(info, "master_link_status")
+      )
+      |> maybe_invalid(
+        "master_host",
+        Map.get(info, "master_host") == host,
+        Map.get(info, "master_host")
+      )
+      |> maybe_invalid(
+        "master_port",
+        parse_integer(Map.get(info, "master_port")) == {:ok, port},
+        Map.get(info, "master_port")
+      )
+
+    if map_size(invalid) == 0,
+      do: :ok,
+      else: {:error, {:invalid_replication_info, invalid}}
+  end
+
+  defp await_sentinel_convergence(state, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_sentinel_convergence(state, deadline)
+  end
+
+  defp do_await_sentinel_convergence(state, deadline) do
+    case sentinel_health(state) do
+      {:ok, _snapshot} = healthy ->
+        healthy
+
+      {:error, _reason} = unhealthy ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          unhealthy
+        else
+          Process.sleep(100)
+          do_await_sentinel_convergence(state, deadline)
+        end
+    end
+  end
+
+  defp sentinel_health(state) do
+    data_nodes = List.wrap(state.master_pid) ++ state.replica_pids
+
+    with true <- Enum.all?(data_nodes, &safe_server_ping/1),
+         true <- Enum.all?(state.sentinel_processes, &sentinel_process_alive?/1),
+         {:ok, reports} <- sentinel_reports(state) do
+      {:ok, reports}
+    else
+      false -> {:error, :topology_process_unreachable}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp sentinel_reports(state) do
+    state.sentinel_ports
+    |> Enum.reduce_while({:ok, []}, fn port, {:ok, reports} ->
+      cli =
+        Cli.new(
+          bin: state.redis_cli_bin,
+          connection: Connection.with_port(state.sentinel_connection, port)
+        )
+
+      with {:ok, info} <- Cli.sentinel_master(cli, state.master_name),
+           :ok <- valid_sentinel_info(info, state.num_replicas, state.num_sentinels) do
+        {:cont, {:ok, [info | reports]}}
+      else
+        {:error, reason} ->
+          {:halt, {:error, {:sentinel_health_failed, port, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, reports} -> {:ok, Enum.reverse(reports)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp valid_sentinel_info(info, replicas, sentinels) do
+    flags =
+      info
+      |> Map.get("flags", "")
+      |> String.split(",", trim: true)
+      |> MapSet.new()
+
+    invalid =
+      %{}
+      |> maybe_invalid(
+        "flags",
+        MapSet.member?(flags, "master") and
+          Enum.all?(["s_down", "o_down", "disconnected"], &(not MapSet.member?(flags, &1))),
+        Map.get(info, "flags")
+      )
+      |> maybe_invalid(
+        "num-slaves",
+        integer_at_least?(Map.get(info, "num-slaves"), replicas),
+        Map.get(info, "num-slaves")
+      )
+      |> maybe_invalid(
+        "num-other-sentinels",
+        integer_at_least?(Map.get(info, "num-other-sentinels"), sentinels - 1),
+        Map.get(info, "num-other-sentinels")
+      )
+
+    if map_size(invalid) == 0,
+      do: :ok,
+      else: {:error, {:invalid_sentinel_info, invalid}}
+  end
+
+  defp sentinel_process_alive?(%{managed: false, os_pid: pid}), do: OSProcess.alive?(pid)
+
+  defp sentinel_process_alive?(%{owner: owner, os_pid: pid}) do
+    Process.alive?(owner) and (is_nil(pid) or OSProcess.alive?(pid))
+  end
+
+  defp stop_sentinel_processes(processes) do
+    Enum.each(processes, fn
+      %{managed: false, os_pid: pid} ->
+        kill_pid(pid)
+
+      %{owner: owner} ->
+        if is_pid(owner) and Process.alive?(owner) do
+          try do
+            ManagedProcess.stop(owner)
+          catch
+            :exit, _reason -> :ok
+          end
+        end
+    end)
+  end
+
+  defp kill_pid(nil), do: :ok
+
+  defp kill_pid(pid) do
+    _result = OSProcess.signal(pid, :term)
+    await_process_exit(pid, 500)
+
+    if OSProcess.alive?(pid) do
+      _result = OSProcess.signal(pid, :kill)
+    end
+
+    :ok
+  end
+
+  defp await_process_exit(pid, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_process_exit(pid, deadline)
+  end
+
+  defp do_await_process_exit(pid, deadline) do
+    cond do
+      not OSProcess.alive?(pid) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        :timeout
+
+      true ->
+        Process.sleep(25)
+        do_await_process_exit(pid, deadline)
+    end
+  end
+
+  defp safe_server_run(server, args) do
+    Server.run(server, args)
+  catch
+    :exit, reason -> {:error, {:server_exit, reason}}
+  end
+
+  defp safe_server_ping(server) do
+    Server.ping(server)
+  catch
+    :exit, _reason -> false
+  end
+
+  defp parse_info(output) do
+    output
+    |> String.split(~r/\r?\n/, trim: true)
+    |> Enum.reject(&String.starts_with?(&1, "#"))
+    |> Enum.reduce(%{}, fn line, acc ->
+      case String.split(line, ":", parts: 2) do
+        [key, value] -> Map.put(acc, String.trim(key), String.trim(value))
+        _other -> acc
+      end
+    end)
+  end
+
+  defp maybe_invalid(invalid, _key, true, _actual), do: invalid
+  defp maybe_invalid(invalid, key, false, actual), do: Map.put(invalid, key, actual)
+
+  defp integer_at_least?(value, minimum) do
+    case parse_integer(value) do
+      {:ok, integer} -> integer >= minimum
+      :error -> false
+    end
+  end
+
+  defp parse_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> {:ok, integer}
+      _other -> :error
+    end
+  end
+
+  defp parse_integer(_value), do: :error
+
   defp read_pidfile(path) do
-    case File.read(path) do
-      {:ok, content} -> content |> String.trim() |> String.to_integer()
-      {:error, _} -> nil
+    with {:ok, content} <- File.read(path),
+         {pid, ""} <- content |> String.trim() |> Integer.parse(),
+         true <- pid > 0 do
+      pid
+    else
+      _other -> nil
     end
   end
 
@@ -699,6 +1044,7 @@ defmodule RedisServerWrapper.Sentinel do
          :ok <- positive_integer(:down_after_ms, settings.down_after_ms),
          :ok <- positive_integer(:failover_timeout_ms, settings.failover_timeout_ms),
          :ok <- positive_integer(:timeout, settings.timeout),
+         :ok <- positive_integer(:convergence_timeout, settings.convergence_timeout),
          :ok <-
            valid_port_span(:replicas, settings.replica_base_port, settings.replicas),
          :ok <-
@@ -746,8 +1092,38 @@ defmodule RedisServerWrapper.Sentinel do
   defp valid_port_span(key, base_port, _count),
     do: {:error, {:invalid_option, :"#{key}_base_port", base_port}}
 
+  defp check_sentinel_endpoints(settings) do
+    settings.sentinel_base_port
+    |> ports_from(settings.sentinels)
+    |> Enum.reduce_while(:ok, fn port, :ok ->
+      case check_port_available(settings.control_host, port) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:sentinel_port_in_use, port, reason}}}
+      end
+    end)
+  end
+
+  defp check_port_available(host, port) do
+    with {:ok, ip} <- :inet.parse_address(to_charlist(host)),
+         {:ok, socket} <-
+           :gen_tcp.listen(port, [
+             :binary,
+             {:ip, ip},
+             {:active, false},
+             {:reuseaddr, true}
+           ]) do
+      :gen_tcp.close(socket)
+      :ok
+    else
+      {:error, :einval} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp ports_from(_base_port, 0), do: []
   defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
+
+  defp replica_port(state, index), do: state.replica_base_port + index
 
   defp format_addr(host, port) do
     if String.contains?(host, ":") do

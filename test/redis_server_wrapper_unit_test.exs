@@ -1,7 +1,16 @@
 defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, Connection, OSProcess, SecureFile, Sentinel, Server}
+  alias RedisServerWrapper.{
+    Cli,
+    Cluster,
+    Connection,
+    ManagedProcess,
+    OSProcess,
+    SecureFile,
+    Sentinel,
+    Server
+  }
 
   setup do
     fixture_dir =
@@ -428,6 +437,10 @@ defmodule RedisServerWrapperUnitTest do
              Cluster.start(replicas_per_master: -1)
 
     assert {:error, {:invalid_option, :timeout, 0}} = Cluster.start(timeout: 0)
+
+    assert {:error, {:invalid_option, :convergence_timeout, 0}} =
+             Cluster.start(convergence_timeout: 0)
+
     assert {:error, {:invalid_option, :base_port, 0}} = Cluster.start(base_port: 0)
 
     assert {:error, {:unsupported_transport, :cluster, :unix}} =
@@ -455,6 +468,10 @@ defmodule RedisServerWrapperUnitTest do
     assert {:error, {:invalid_option, :sentinels, 0}} = Sentinel.start(sentinels: 0)
     assert {:error, {:invalid_quorum, 4, 3}} = Sentinel.start(quorum: 4)
     assert {:error, {:invalid_option, :timeout, 0}} = Sentinel.start(timeout: 0)
+
+    assert {:error, {:invalid_option, :convergence_timeout, 0}} =
+             Sentinel.start(convergence_timeout: 0)
+
     assert {:error, {:invalid_option, :master_port, "bad"}} = Sentinel.start(master_port: "bad")
 
     assert {:error, {:unsupported_transport, :sentinel, :unix}} =
@@ -483,6 +500,122 @@ defmodule RedisServerWrapperUnitTest do
                sentinel_base_port: 6391,
                quorum: 1
              )
+  end
+
+  test "managed process validates backend, executable, and argv" do
+    common = [ready: fn -> true end, ready_timeout_ms: 100]
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      assert {:error, {:invalid_managed, :unknown}} =
+               ManagedProcess.start_link(
+                 common ++ [backend: :unknown, argv: ["/bin/sh", "-c", "exit 0"]]
+               )
+
+      assert {:error, {:executable_not_found, "missing-managed-process"}} =
+               ManagedProcess.start_link(
+                 common ++ [backend: true, argv: ["missing-managed-process"]]
+               )
+
+      assert {:error, {:invalid_argv, []}} =
+               ManagedProcess.start_link(common ++ [backend: true, argv: []])
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
+  test "managed Port process reports info and tolerates a raising shutdown callback", %{
+    fixture_dir: fixture_dir
+  } do
+    script =
+      write_executable(
+        fixture_dir,
+        "long-running-process",
+        "#!/bin/sh\necho started\nwhile :; do sleep 1; done\n"
+      )
+
+    test_pid = self()
+
+    {:ok, process} =
+      ManagedProcess.start_link(
+        backend: true,
+        argv: [script],
+        ready: fn -> true end,
+        ready_timeout_ms: 1_000,
+        label: "unit managed process",
+        shutdown: fn ->
+          send(test_pid, :shutdown_called)
+          raise "ignored shutdown failure"
+        end
+      )
+
+    assert %{backend: true, pid: os_pid} = ManagedProcess.info(process)
+    assert is_integer(os_pid)
+    assert :ok = ManagedProcess.stop(process)
+    assert_receive :shutdown_called
+    refute OSProcess.alive?(os_pid)
+  end
+
+  test "managed Port process reports readiness timeout and early exit", %{
+    fixture_dir: fixture_dir
+  } do
+    sleeper = write_executable(fixture_dir, "sleeping-process", "#!/bin/sh\nsleep 5\n")
+    exiting = write_executable(fixture_dir, "exiting-process", "#!/bin/sh\nexit 7\n")
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      assert {:error, {:managed_process_start_failed, "timeout", :ready_timeout}} =
+               ManagedProcess.start_link(
+                 backend: true,
+                 argv: [sleeper],
+                 ready: fn -> false end,
+                 ready_timeout_ms: 20,
+                 label: "timeout"
+               )
+
+      assert {:error, {:managed_process_start_failed, "early-exit", :exited_before_ready}} =
+               ManagedProcess.start_link(
+                 backend: true,
+                 argv: [exiting],
+                 ready: fn -> false end,
+                 ready_timeout_ms: 1_000,
+                 label: "early-exit"
+               )
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
+  test "managed Forcola process translates child exit into its lifecycle reason", %{
+    fixture_dir: fixture_dir
+  } do
+    script =
+      write_executable(
+        fixture_dir,
+        "forcola-exiting-process",
+        "#!/bin/sh\nsleep 1\nexit 7\n"
+      )
+
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      {:ok, process} =
+        ManagedProcess.start_link(
+          backend: :forcola,
+          argv: [script],
+          ready: fn -> true end,
+          ready_timeout_ms: 1_000,
+          label: "forcola-test"
+        )
+
+      monitor = Process.monitor(process)
+
+      assert_receive {:DOWN, ^monitor, :process, ^process,
+                      {:managed_process_exit, "forcola-test", :forcola, _reason}},
+                     5_000
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
   end
 
   defp write_executable(dir, name, contents) do
