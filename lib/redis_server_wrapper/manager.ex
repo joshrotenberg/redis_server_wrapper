@@ -201,6 +201,7 @@ defmodule RedisServerWrapper.Manager do
     * `:master_port` - master port (default: 6390)
     * `:replicas` - number of replicas (default: 2)
     * `:sentinels` - number of sentinels (default: 3)
+    * `:quorum` - Sentinel quorum (default: min(2, sentinels))
     * `:sentinel_base_port` - starting sentinel port (default: 26389)
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
@@ -214,6 +215,7 @@ defmodule RedisServerWrapper.Manager do
     master_port = Keyword.get(opts, :master_port, 6390)
     num_replicas = Keyword.get(opts, :replicas, 2)
     num_sentinels = Keyword.get(opts, :sentinels, 3)
+    quorum = Keyword.get(opts, :quorum, min(2, num_sentinels))
     sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     loadmodule = Keyword.get(opts, :loadmodule, [])
@@ -225,6 +227,7 @@ defmodule RedisServerWrapper.Manager do
         master_port: master_port,
         replicas: num_replicas,
         sentinels: num_sentinels,
+        quorum: quorum,
         sentinel_base_port: sentinel_base_port,
         bind: bind,
         password: password,
@@ -243,9 +246,9 @@ defmodule RedisServerWrapper.Manager do
 
           all_redis_ports =
             [master_port] ++
-              Enum.map(0..(num_replicas - 1), &(replica_base_port + &1))
+              ports_from(replica_base_port, num_replicas)
 
-          sentinel_ports = Enum.map(0..(num_sentinels - 1), &(sentinel_base_port + &1))
+          sentinel_ports = ports_from(sentinel_base_port, num_sentinels)
 
           # Read OS pids from pidfiles
           redis_pids =
@@ -338,7 +341,7 @@ defmodule RedisServerWrapper.Manager do
   @doc """
   Stops a named instance by sending SHUTDOWN to all its processes.
   """
-  @spec stop(String.t()) :: :ok | {:error, :not_found}
+  @spec stop(String.t()) :: :ok | {:error, term()}
   def stop(name) do
     state = load_state()
 
@@ -347,29 +350,48 @@ defmodule RedisServerWrapper.Manager do
         {:error, :not_found}
 
       instance ->
-        stop_instance_processes(instance)
-        save_state(remove_instance(state, name))
-        IO.puts("Stopped #{name}")
-        :ok
+        case stop_instance_processes(instance) do
+          :ok ->
+            save_state(remove_instance(state, name))
+            IO.puts("Stopped #{name}")
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
   @doc """
   Stops all tracked instances.
   """
-  @spec stop_all() :: :ok
+  @spec stop_all() :: :ok | {:error, {:instances_not_stopped, map()}}
   def stop_all do
     state = load_state()
 
-    state.instances
-    |> Map.values()
-    |> Enum.each(fn instance ->
-      stop_instance_processes(instance)
-      IO.puts("Stopped #{instance.name}")
-    end)
+    {remaining, failures} =
+      Enum.reduce(state.instances, {%{}, %{}}, fn {name, instance}, {remaining, failures} ->
+        case stop_instance_processes(instance) do
+          :ok ->
+            IO.puts("Stopped #{instance.name}")
+            {remaining, failures}
 
-    save_state(%{state | instances: %{}, counters: %{}})
-    :ok
+          {:error, reason} ->
+            {Map.put(remaining, name, instance), Map.put(failures, name, reason)}
+        end
+      end)
+
+    save_state(%{
+      state
+      | instances: remaining,
+        counters: if(remaining == %{}, do: %{}, else: state.counters)
+    })
+
+    if failures == %{} do
+      :ok
+    else
+      {:error, {:instances_not_stopped, failures}}
+    end
   end
 
   @doc """
@@ -527,24 +549,82 @@ defmodule RedisServerWrapper.Manager do
   # -------------------------------------------------------------------
 
   defp stop_instance_processes(instance) do
-    # First try graceful SHUTDOWN via redis-cli on each port
-    Enum.each(instance.ports, fn port ->
-      cli = Cli.new(host: instance.bind, port: port, password: instance.password)
-      Cli.shutdown(cli)
-    end)
+    case owned_listeners(instance) do
+      {:ok, listeners} -> stop_owned_instance(instance, listeners)
+      {:error, _reason} = error -> error
+    end
+  end
 
+  defp stop_owned_instance(instance, listeners) when map_size(listeners) == 0 do
+    if Enum.any?(instance.pids, &OSProcess.alive?/1) do
+      {:error, {:process_ownership_not_verified, instance.name, instance.pids}}
+    else
+      :ok
+    end
+  end
+
+  defp stop_owned_instance(instance, listeners) do
+    gracefully_stop_owned_listeners(instance, listeners)
     Process.sleep(1000)
 
-    # Then SIGTERM/SIGKILL any remaining PIDs
-    Enum.each(instance.pids, fn pid ->
-      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :term)
-    end)
+    with :ok <- signal_owned_listeners(instance, :term),
+         _ <- Process.sleep(500),
+         :ok <- signal_owned_listeners(instance, :kill) do
+      verify_instance_stopped(instance)
+    end
+  end
 
-    Process.sleep(500)
+  defp verify_instance_stopped(instance) do
+    case Enum.filter(instance.pids, &OSProcess.alive?/1) do
+      [] -> :ok
+      remaining -> {:error, {:processes_still_running, instance.name, remaining}}
+    end
+  end
 
-    Enum.each(instance.pids, fn pid ->
-      if OSProcess.alive?(pid), do: OSProcess.signal(pid, :kill)
+  defp owned_listeners(instance) do
+    Enum.reduce_while(
+      instance.ports,
+      {:ok, %{}},
+      &collect_owned_listener(&1, &2, instance)
+    )
+  end
+
+  defp collect_owned_listener(port, {:ok, listeners}, instance) do
+    case OSProcess.pids_on_port(port) do
+      {:ok, port_pids} ->
+        owned_pids = Enum.filter(port_pids, &(&1 in instance.pids))
+        {:cont, {:ok, maybe_put_listener(listeners, port, owned_pids)}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:process_ownership_not_verified, instance.name, reason}}}
+    end
+  end
+
+  defp maybe_put_listener(listeners, _port, []), do: listeners
+  defp maybe_put_listener(listeners, port, pids), do: Map.put(listeners, port, pids)
+
+  defp gracefully_stop_owned_listeners(instance, listeners) do
+    Enum.each(Map.keys(listeners), fn port ->
+      cli = Cli.new(host: instance.bind, port: port, password: instance.password)
+      _result = Cli.run(cli, ["SHUTDOWN", "NOSAVE"])
     end)
+  end
+
+  defp signal_owned_listeners(instance, signal) do
+    with {:ok, listeners} <- owned_listeners(instance) do
+      listeners
+      |> Map.values()
+      |> List.flatten()
+      |> Enum.uniq()
+      |> Enum.reduce_while(:ok, &signal_listener(&1, signal, &2))
+    end
+  end
+
+  defp signal_listener(pid, signal, :ok) do
+    case OSProcess.signal(pid, signal) do
+      :ok -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
   end
 
   defp check_status(instance) do
@@ -582,6 +662,9 @@ defmodule RedisServerWrapper.Manager do
       {:error, _} -> nil
     end
   end
+
+  defp ports_from(_base_port, 0), do: []
+  defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
 
   # -------------------------------------------------------------------
   # URL building

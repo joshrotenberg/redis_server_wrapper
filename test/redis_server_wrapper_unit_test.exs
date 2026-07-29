@@ -1,9 +1,7 @@
 defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
-
-  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Server}
+  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Sentinel, Server}
 
   setup do
     fixture_dir =
@@ -216,7 +214,7 @@ defmodule RedisServerWrapperUnitTest do
     assert {:ok, [123, 456]} = OSProcess.pids_on_port(6490)
   end
 
-  test "missing kill and lsof do not crash teardown or cluster pre-cleanup", %{
+  test "missing kill and lsof do not crash process helpers or normal teardown", %{
     cli_bin: cli_bin
   } do
     redis_server_bin = System.find_executable("redis-server")
@@ -237,28 +235,72 @@ defmodule RedisServerWrapperUnitTest do
     assert is_boolean(OSProcess.alive?(String.to_integer(System.pid())))
     assert is_boolean(OSProcess.orphaned?(String.to_integer(System.pid())))
 
-    log =
-      capture_log(fn ->
-        assert {:ok, server} =
-                 Server.start_link(
-                   port: 6490,
-                   redis_server_bin: redis_server_bin,
-                   redis_cli_bin: redis_cli_bin
-                 )
+    assert {:ok, server} =
+             Server.start_link(
+               port: 6490,
+               redis_server_bin: redis_server_bin,
+               redis_cli_bin: redis_cli_bin
+             )
 
-        assert :ok = Server.stop(server)
+    assert :ok = Server.stop(server)
 
-        assert {:error, {:node_start_failed, 7490, _reason}} =
-                 Cluster.start(
-                   masters: 1,
-                   base_port: 7490,
-                   timeout: 20,
-                   redis_server_bin: false_bin,
-                   redis_cli_bin: cli_bin
-                 )
-      end)
+    assert {:error, {:node_start_failed, 7490, _reason}} =
+             Cluster.start(
+               masters: 1,
+               base_port: 7490,
+               timeout: 20,
+               redis_server_bin: false_bin,
+               redis_cli_bin: cli_bin
+             )
+  end
 
-    assert log =~ "lsof is unavailable"
+  test "cluster validates counts, ports, and timeouts before startup" do
+    assert {:error, {:invalid_option, :masters, 0}} = Cluster.start(masters: 0)
+
+    assert {:error, {:invalid_option, :replicas_per_master, -1}} =
+             Cluster.start(replicas_per_master: -1)
+
+    assert {:error, {:invalid_option, :timeout, 0}} = Cluster.start(timeout: 0)
+    assert {:error, {:invalid_option, :base_port, 0}} = Cluster.start(base_port: 0)
+
+    assert {:error, {:invalid_port_range, :cluster_nodes, 65_535, 65_536}} =
+             Cluster.start(masters: 2, base_port: 65_535)
+
+    assert {:error, {:invalid_port_range, :cluster_bus, 65_536, 65_536}} =
+             Cluster.start(masters: 1, base_port: 55_536)
+
+    assert {:error,
+            {:overlapping_port_ranges, :cluster_nodes, 1, 10_001, :cluster_bus, 10_001, 20_001}} =
+             Cluster.start(masters: 10_001, base_port: 1)
+  end
+
+  test "sentinel validates counts, quorum, ports, and timeouts before startup" do
+    assert {:error, {:invalid_option, :replicas, -1}} = Sentinel.start(replicas: -1)
+    assert {:error, {:invalid_option, :sentinels, 0}} = Sentinel.start(sentinels: 0)
+    assert {:error, {:invalid_quorum, 4, 3}} = Sentinel.start(quorum: 4)
+    assert {:error, {:invalid_option, :timeout, 0}} = Sentinel.start(timeout: 0)
+    assert {:error, {:invalid_option, :master_port, "bad"}} = Sentinel.start(master_port: "bad")
+
+    assert {:error, {:invalid_option, :sentinel_base_port, 0}} =
+             Sentinel.start(sentinel_base_port: 0)
+
+    assert {:error, {:invalid_option, :replicas_base_port, "bad"}} =
+             Sentinel.start(replicas: 1, replica_base_port: "bad")
+
+    assert {:error, {:invalid_port_range, :replicas, 65_535, 65_536}} =
+             Sentinel.start(replicas: 2, replica_base_port: 65_535)
+
+    assert {:error, {:invalid_port_range, :sentinels, 65_535, 65_536}} =
+             Sentinel.start(sentinels: 2, sentinel_base_port: 65_535, quorum: 1)
+
+    assert {:error, {:overlapping_ports, [6390, 6391, 6391]}} =
+             Sentinel.start(
+               replicas: 1,
+               sentinels: 1,
+               replica_base_port: 6391,
+               sentinel_base_port: 6391,
+               quorum: 1
+             )
   end
 
   defp write_executable(dir, name, contents) do

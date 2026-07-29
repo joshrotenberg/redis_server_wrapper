@@ -23,10 +23,11 @@ end
 ## Prerequisites
 
 You need `redis-server` and `redis-cli` installed and available on your PATH.
-The wrapper uses `kill`, `ps`, and `lsof` for enhanced process inspection and
-best-effort forced cleanup when they are present, but normal server, cluster,
-and sentinel lifecycle operations degrade safely when minimal runtime images
-omit them. Signal-based functions in `RedisServerWrapper.Chaos` still require
+The wrapper uses `kill` and `lsof` for process inspection and management
+when they are present, but normal server, cluster, and sentinel lifecycle
+operations degrade safely when minimal runtime images omit them. Occupied ports
+fail startup; the wrapper does not shut down or signal an existing listener to
+claim a port. Signal-based functions in `RedisServerWrapper.Chaos` still require
 `kill`.
 
 ```bash
