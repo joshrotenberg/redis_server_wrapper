@@ -28,6 +28,8 @@ defmodule RedisServerWrapper do
     * **Cluster** - spin up N-master clusters with optional replicas
     * **Sentinel** - full sentinel topology (master + replicas + sentinels)
     * **Custom binaries** - point to any `redis-server`/`redis-cli` path
+    * **Custom modules** - load modules with argument-safe configuration on
+      standalone servers, cluster nodes, and sentinel data nodes
     * **Arbitrary config** - pass any Redis directive via `:extra` option
   """
 

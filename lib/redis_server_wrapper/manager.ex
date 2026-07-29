@@ -21,10 +21,7 @@ defmodule RedisServerWrapper.Manager do
 
   alias RedisServerWrapper.{Cli, Cluster, Sentinel, Server}
 
-  require Logger
-
-  @config_dir Path.expand("~/.config/redis-server-wrapper")
-  @state_file Path.join(@config_dir, "instances.json")
+  @default_state_file Path.expand("~/.config/redis-server-wrapper/instances.json")
 
   @type instance_type :: :basic | :cluster | :sentinel
   @type instance :: %{
@@ -54,6 +51,7 @@ defmodule RedisServerWrapper.Manager do
     * `:bind` - bind address (default: "127.0.0.1")
     * `:persist` - enable persistence (default: false)
     * `:maxmemory` - memory limit (e.g., "256mb")
+    * `:loadmodule` - modules to load; accepts paths or `{path, [args]}` tuples
     * Plus any `RedisServerWrapper.Config` options via `:extra`
   """
   @spec start_basic(keyword()) :: {:ok, instance()} | {:error, term()}
@@ -65,6 +63,7 @@ defmodule RedisServerWrapper.Manager do
     bind = Keyword.get(opts, :bind, "127.0.0.1")
     persist = Keyword.get(opts, :persist, false)
     maxmemory = Keyword.get(opts, :maxmemory)
+    loadmodule = Keyword.get(opts, :loadmodule, [])
     extra = Keyword.get(opts, :extra, [])
 
     if Map.has_key?(state.instances, name) do
@@ -76,7 +75,9 @@ defmodule RedisServerWrapper.Manager do
           bind: bind,
           password: password,
           save: if(persist, do: :default, else: :disabled),
-          appendonly: persist
+          appendonly: persist,
+          managed: false,
+          loadmodule: loadmodule
         ]
         |> maybe_put(:maxmemory, maxmemory)
         |> maybe_put(:extra, if(extra != [], do: extra))
@@ -124,6 +125,7 @@ defmodule RedisServerWrapper.Manager do
     * `:base_port` - starting port (default: 7100)
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:loadmodule` - modules loaded into every cluster node
   """
   @spec start_cluster(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_cluster(opts \\ []) do
@@ -134,6 +136,7 @@ defmodule RedisServerWrapper.Manager do
     replicas = Keyword.get(opts, :replicas_per_master, 0)
     base_port = Keyword.get(opts, :base_port, 7100)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+    loadmodule = Keyword.get(opts, :loadmodule, [])
 
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
@@ -143,7 +146,9 @@ defmodule RedisServerWrapper.Manager do
         replicas_per_master: replicas,
         base_port: base_port,
         bind: bind,
-        password: password
+        password: password,
+        managed: false,
+        loadmodule: loadmodule
       ]
 
       case Cluster.start_link(cluster_opts) do
@@ -197,6 +202,7 @@ defmodule RedisServerWrapper.Manager do
     * `:sentinel_base_port` - starting sentinel port (default: 26389)
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:loadmodule` - modules loaded into the master and every replica
   """
   @spec start_sentinel(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_sentinel(opts \\ []) do
@@ -208,6 +214,7 @@ defmodule RedisServerWrapper.Manager do
     num_sentinels = Keyword.get(opts, :sentinels, 3)
     sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+    loadmodule = Keyword.get(opts, :loadmodule, [])
 
     if Map.has_key?(state.instances, name) do
       {:error, {:instance_exists, name}}
@@ -218,7 +225,9 @@ defmodule RedisServerWrapper.Manager do
         sentinels: num_sentinels,
         sentinel_base_port: sentinel_base_port,
         bind: bind,
-        password: password
+        password: password,
+        managed: false,
+        loadmodule: loadmodule
       ]
 
       case Sentinel.start_link(sentinel_opts) do
@@ -388,9 +397,10 @@ defmodule RedisServerWrapper.Manager do
   # -------------------------------------------------------------------
 
   defp load_state do
-    File.mkdir_p!(@config_dir)
+    state_file = state_file()
+    File.mkdir_p!(Path.dirname(state_file))
 
-    case File.read(@state_file) do
+    case File.read(state_file) do
       {:ok, content} when byte_size(content) > 0 ->
         data = JSON.decode!(content)
         deserialize_state(data)
@@ -401,10 +411,15 @@ defmodule RedisServerWrapper.Manager do
   end
 
   defp save_state(state) do
-    File.mkdir_p!(@config_dir)
+    state_file = state_file()
+    File.mkdir_p!(Path.dirname(state_file))
     json = encode_json(serialize_state(state))
-    File.write!(@state_file, json)
+    File.write!(state_file, json)
     state
+  end
+
+  defp state_file do
+    Application.get_env(:redis_server_wrapper, :manager_state_file, @default_state_file)
   end
 
   defp empty_state, do: %{instances: %{}, counters: %{}}

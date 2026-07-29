@@ -30,11 +30,12 @@ defmodule RedisServerWrapper.Cluster do
     * `:redis_cli_bin` - redis-cli binary path
     * `:timeout` - startup timeout per node in ms (default: 10_000)
     * `:cluster_node_timeout` - cluster node timeout in ms (default: 5000)
+    * `:loadmodule` - modules loaded into every cluster node; accepts paths or
+      `{path, [args]}` tuples (default: `[]`)
     * `:extra` - extra redis config directives as `[{key, value}]`
-    * `:managed` - when `true` (default), each node runs as a Port tied
-      to the BEAM lifecycle. When `false`, nodes daemonize independently
-      and survive BEAM exits; combine with `detach/1` so this GenServer
-      will not tear them down on terminate either.
+    * `:managed` - process lifecycle backend forwarded to every node. See
+      `RedisServerWrapper.Server` for `true`, `:forcola`, and `false`.
+      Only `managed: false` supports `detach/1`.
   """
 
   use GenServer
@@ -98,8 +99,8 @@ defmodule RedisServerWrapper.Cluster do
   @spec run(GenServer.server(), [String.t()]) :: {:ok, String.t()} | {:error, String.t()}
   def run(server, args), do: GenServer.call(server, {:run, args})
 
-  @doc "Detach — cluster processes will not be stopped on terminate."
-  @spec detach(GenServer.server()) :: :ok
+  @doc "Detaches daemonized cluster nodes so their OS processes survive this GenServer."
+  @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
   @doc "Stops the cluster."
@@ -126,6 +127,7 @@ defmodule RedisServerWrapper.Cluster do
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
+    loadmodule = Keyword.get(opts, :loadmodule, [])
     extra = Keyword.get(opts, :extra, [])
     managed = Keyword.get(opts, :managed, true)
 
@@ -143,6 +145,7 @@ defmodule RedisServerWrapper.Cluster do
       redis_cli_bin: redis_cli_bin,
       timeout: timeout,
       cluster_node_timeout: cluster_node_timeout,
+      loadmodule: loadmodule,
       extra: extra,
       managed: managed
     }
@@ -244,8 +247,10 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   def handle_call(:detach, _from, state) do
-    Enum.each(state.node_pids, &Server.detach/1)
-    {:reply, :ok, %{state | detached: true}}
+    case detach_servers(state.node_pids) do
+      :ok -> {:reply, :ok, %{state | detached: true}}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   @impl true
@@ -258,8 +263,9 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   @impl true
-  def terminate(_reason, %{detached: true}) do
-    Logger.debug("RedisServerWrapper.Cluster terminating (detached)")
+  def terminate(_reason, %{detached: true} = state) do
+    Logger.debug("RedisServerWrapper.Cluster terminating (OS processes detached)")
+    stop_servers(state.node_pids)
     :ok
   end
 
@@ -268,13 +274,7 @@ defmodule RedisServerWrapper.Cluster do
       "RedisServerWrapper.Cluster terminating, stopping #{length(state.node_pids)} nodes"
     )
 
-    Enum.each(state.node_pids, fn pid ->
-      try do
-        Server.stop(pid)
-      catch
-        :exit, _ -> :ok
-      end
-    end)
+    stop_servers(state.node_pids)
 
     :ok
   end
@@ -298,6 +298,7 @@ defmodule RedisServerWrapper.Cluster do
             cluster_enabled: true,
             cluster_config_file: "nodes-#{port}.conf",
             cluster_node_timeout: node_opts.cluster_node_timeout,
+            loadmodule: node_opts.loadmodule,
             save: :disabled
           ] ++ extra_to_opts(node_opts.extra)
 
@@ -348,6 +349,25 @@ defmodule RedisServerWrapper.Cluster do
 
   defp extra_to_opts([]), do: []
   defp extra_to_opts(extra), do: [extra: extra]
+
+  defp detach_servers(servers) do
+    Enum.reduce_while(servers, :ok, fn server, :ok ->
+      case Server.detach(server) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp stop_servers(servers) do
+    Enum.each(servers, fn server ->
+      try do
+        Server.stop(server)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+  end
 
   # Remove stale cluster config files from a node's data directory.
   # These persist across runs and cause "Node is not empty" errors

@@ -30,11 +30,13 @@ defmodule RedisServerWrapper.Sentinel do
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
     * `:timeout` - startup timeout per node in ms (default: 10_000)
-    * `:managed` - when `true` (default), master and replicas run as
-      Ports tied to the BEAM lifecycle. When `false`, they daemonize
-      independently and survive BEAM exits; combine with `detach/1`
-      so this GenServer will not tear them down on terminate either.
-      Sentinel processes always daemonize regardless of this flag.
+    * `:loadmodule` - modules loaded into the master and every replica; accepts
+      paths or `{path, [args]}` tuples (default: `[]`). Sentinel processes do
+      not load data modules.
+    * `:managed` - process lifecycle backend forwarded to the master and every
+      replica. See `RedisServerWrapper.Server` for `true`, `:forcola`, and
+      `false`. Only `managed: false` supports `detach/1`. Sentinel processes
+      always daemonize regardless of this flag.
   """
 
   use GenServer
@@ -95,8 +97,8 @@ defmodule RedisServerWrapper.Sentinel do
   @spec poke(GenServer.server()) :: {:ok, map()} | {:error, term()}
   def poke(server), do: GenServer.call(server, :poke)
 
-  @doc "Detach — processes will not be stopped on terminate."
-  @spec detach(GenServer.server()) :: :ok
+  @doc "Detaches daemonized data nodes so their OS processes survive this GenServer."
+  @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
   @doc "Stops the sentinel topology."
@@ -128,6 +130,7 @@ defmodule RedisServerWrapper.Sentinel do
 
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
+    loadmodule = Keyword.get(opts, :loadmodule, [])
     managed = Keyword.get(opts, :managed, true)
 
     all_ports =
@@ -145,6 +148,7 @@ defmodule RedisServerWrapper.Sentinel do
       redis_server_bin: redis_server_bin,
       redis_cli_bin: redis_cli_bin,
       timeout: timeout,
+      loadmodule: loadmodule,
       managed: managed
     }
 
@@ -255,9 +259,10 @@ defmodule RedisServerWrapper.Sentinel do
   end
 
   def handle_call(:detach, _from, state) do
-    Server.detach(state.master_pid)
-    Enum.each(state.replica_pids, &Server.detach/1)
-    {:reply, :ok, %{state | detached: true}}
+    case detach_servers([state.master_pid | state.replica_pids]) do
+      :ok -> {:reply, :ok, %{state | detached: true}}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   @impl true
@@ -270,8 +275,9 @@ defmodule RedisServerWrapper.Sentinel do
   end
 
   @impl true
-  def terminate(_reason, %{detached: true}) do
-    Logger.debug("RedisServerWrapper.Sentinel terminating (detached)")
+  def terminate(_reason, %{detached: true} = state) do
+    Logger.debug("RedisServerWrapper.Sentinel terminating (OS processes detached)")
+    stop_servers(state.replica_pids ++ [state.master_pid])
     :ok
   end
 
@@ -294,19 +300,7 @@ defmodule RedisServerWrapper.Sentinel do
     end)
 
     # Stop replicas, then master
-    Enum.each(state.replica_pids, fn pid ->
-      try do
-        Server.stop(pid)
-      catch
-        :exit, _ -> :ok
-      end
-    end)
-
-    try do
-      Server.stop(state.master_pid)
-    catch
-      :exit, _ -> :ok
-    end
+    stop_servers(state.replica_pids ++ [state.master_pid])
 
     # Clean up sentinel config directory
     if state.sentinel_dir, do: File.rm_rf(state.sentinel_dir)
@@ -327,6 +321,7 @@ defmodule RedisServerWrapper.Sentinel do
       redis_cli_bin: node_opts.redis_cli_bin,
       timeout: node_opts.timeout,
       managed: node_opts.managed,
+      loadmodule: node_opts.loadmodule,
       save: :disabled
     )
   end
@@ -348,6 +343,7 @@ defmodule RedisServerWrapper.Sentinel do
           redis_cli_bin: node_opts.redis_cli_bin,
           timeout: node_opts.timeout,
           managed: node_opts.managed,
+          loadmodule: node_opts.loadmodule,
           save: :disabled
         ]
 
@@ -498,6 +494,25 @@ defmodule RedisServerWrapper.Sentinel do
     Enum.each(ports, fn port ->
       cli = Cli.new(bin: redis_cli_bin, host: bind, port: port, password: password)
       Cli.shutdown(cli)
+    end)
+  end
+
+  defp detach_servers(servers) do
+    Enum.reduce_while(servers, :ok, fn server, :ok ->
+      case Server.detach(server) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp stop_servers(servers) do
+    Enum.each(servers, fn server ->
+      try do
+        Server.stop(server)
+      catch
+        :exit, _ -> :ok
+      end
     end)
   end
 

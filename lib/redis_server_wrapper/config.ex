@@ -11,6 +11,14 @@ defmodule RedisServerWrapper.Config do
   @type log_level :: :debug | :verbose | :notice | :warning
   @type append_fsync :: :always | :everysec | :no
   @type save_policy :: :disabled | :default | [{pos_integer(), pos_integer()}]
+  @typedoc """
+  A Redis module path, optionally paired with an argument vector.
+
+  Plain strings preserve the original raw `loadmodule` directive behavior.
+  Prefer `{path, args}` when arguments are needed so paths and arguments are
+  quoted safely in the generated config.
+  """
+  @type module_spec :: String.t() | {String.t(), [String.t()]}
 
   @type t :: %__MODULE__{
           port: non_neg_integer(),
@@ -51,7 +59,7 @@ defmodule RedisServerWrapper.Config do
           cluster_announce_port: non_neg_integer() | nil,
           cluster_announce_bus_port: non_neg_integer() | nil,
           # Modules
-          loadmodule: [String.t()],
+          loadmodule: [module_spec()],
           # Catch-all
           extra: [{String.t(), String.t()}]
         }
@@ -94,10 +102,18 @@ defmodule RedisServerWrapper.Config do
   Creates a new config from keyword options.
 
       Config.new(port: 6400, password: "secret", appendonly: true)
+
+      Config.new(
+        loadmodule: [
+          {"/path/to/module.so", ["events", "expired,set", "maxlen", "10000"]}
+        ]
+      )
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
-    struct!(__MODULE__, opts)
+    config = struct!(__MODULE__, opts)
+    validate_modules!(config.loadmodule)
+    config
   end
 
   @doc """
@@ -186,13 +202,62 @@ defmodule RedisServerWrapper.Config do
   defp emit_modules(acc, []), do: acc
 
   defp emit_modules(acc, modules) do
-    Enum.reduce(modules, acc, fn mod, acc -> ["loadmodule #{mod}" | acc] end)
+    Enum.reduce(modules, acc, &emit_module/2)
+  end
+
+  # Preserve the original raw-string form for backwards compatibility. This
+  # allows existing callers that put both the path and arguments in one string
+  # to keep working unchanged.
+  defp emit_module(module, acc) when is_binary(module), do: ["loadmodule #{module}" | acc]
+
+  defp emit_module({path, args}, acc) do
+    directive =
+      [path | args]
+      |> Enum.map_join(" ", &quote_module_token/1)
+
+    ["loadmodule #{directive}" | acc]
   end
 
   defp emit_extra(acc, []), do: acc
 
   defp emit_extra(acc, extras) do
     Enum.reduce(extras, acc, fn {key, value}, acc -> ["#{key} #{value}" | acc] end)
+  end
+
+  defp validate_modules!(modules) when is_list(modules) do
+    Enum.each(modules, fn
+      module when is_binary(module) and module != "" ->
+        :ok
+
+      {path, args} when is_binary(path) and path != "" and is_list(args) ->
+        if Enum.all?(args, &is_binary/1) do
+          :ok
+        else
+          invalid_module_spec!({path, args})
+        end
+
+      other ->
+        invalid_module_spec!(other)
+    end)
+  end
+
+  defp validate_modules!(other), do: invalid_module_spec!(other)
+
+  defp invalid_module_spec!(value) do
+    raise ArgumentError,
+          ":loadmodule must be a list of paths or {path, [args]} tuples, got: " <>
+            inspect(value)
+  end
+
+  defp quote_module_token(value) do
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\r", "\\r")
+
+    ~s("#{escaped}")
   end
 
   defp yn(true), do: "yes"

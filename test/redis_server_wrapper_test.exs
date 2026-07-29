@@ -1,7 +1,7 @@
 defmodule RedisServerWrapperTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, Config, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, Config, Manager, Sentinel, Server}
 
   defp wait_until(fun, retries \\ 10, delay \\ 1000) do
     if fun.() do
@@ -87,6 +87,29 @@ defmodule RedisServerWrapperTest do
       output = Config.to_config_string(config)
       assert output =~ "maxmemory-policy allkeys-lru"
       assert output =~ "hz 20"
+    end
+
+    test "module paths and structured module arguments" do
+      config =
+        Config.new(
+          loadmodule: [
+            "/modules/legacy.so events expired",
+            {"/modules/event stream.so", ["events", "expired,set", "maxlen", "10000"]}
+          ]
+        )
+
+      output = Config.to_config_string(config)
+
+      assert output =~ "loadmodule /modules/legacy.so events expired"
+
+      assert output =~
+               ~s(loadmodule "/modules/event stream.so" "events" "expired,set" "maxlen" "10000")
+    end
+
+    test "rejects invalid module specifications" do
+      assert_raise ArgumentError, ~r/:loadmodule must be a list/, fn ->
+        Config.new(loadmodule: [{"/modules/bad.so", [:not_a_string]}])
+      end
     end
 
     test "TLS config" do
@@ -304,13 +327,114 @@ defmodule RedisServerWrapperTest do
     end
   end
 
+  describe "Manager" do
+    setup do
+      temp_dir =
+        Path.join([
+          System.tmp_dir!(),
+          "redis-server-wrapper-tests",
+          "manager-#{System.unique_integer([:positive])}"
+        ])
+
+      state_file = Path.join(temp_dir, "instances.json")
+      previous_state_file = Application.fetch_env(:redis_server_wrapper, :manager_state_file)
+      Application.put_env(:redis_server_wrapper, :manager_state_file, state_file)
+
+      on_exit(fn ->
+        Enum.each([6430, 6470, 6471, 7430, 7431, 7432, 26_470], fn port ->
+          Cli.shutdown(Cli.new(port: port))
+        end)
+
+        case previous_state_file do
+          {:ok, value} ->
+            Application.put_env(:redis_server_wrapper, :manager_state_file, value)
+
+          :error ->
+            Application.delete_env(:redis_server_wrapper, :manager_state_file)
+        end
+
+        File.rm_rf!(temp_dir)
+      end)
+
+      :ok
+    end
+
+    test "basic instances remain running after the launcher GenServer exits" do
+      assert {:ok, instance} =
+               Manager.start_basic(name: "demo-persistent", port: 6430, password: nil)
+
+      assert [_ | _] = instance.pids
+      assert wait_until(fn -> Cli.ping(Cli.new(port: 6430)) end, 5, 200)
+      assert {:ok, %{status: :running}} = Manager.info("demo-persistent")
+
+      assert :ok = Manager.stop("demo-persistent")
+      assert wait_until(fn -> not Cli.ping(Cli.new(port: 6430)) end, 5, 200)
+    end
+
+    @tag timeout: 30_000
+    test "cluster instances persist without orphaning node GenServers" do
+      assert {:ok, _instance} =
+               Manager.start_cluster(
+                 name: "demo-cluster",
+                 masters: 3,
+                 base_port: 7430,
+                 password: nil
+               )
+
+      assert wait_until(
+               fn -> Enum.all?(7430..7432, &Cli.ping(Cli.new(port: &1))) end,
+               10,
+               500
+             )
+
+      assert :ok = Manager.stop("demo-cluster")
+
+      assert wait_until(
+               fn -> Enum.all?(7430..7432, &(not Cli.ping(Cli.new(port: &1)))) end,
+               10,
+               200
+             )
+    end
+
+    @tag timeout: 30_000
+    test "sentinel instances persist after the launcher exits" do
+      assert {:ok, _instance} =
+               Manager.start_sentinel(
+                 name: "demo-sentinel",
+                 master_port: 6470,
+                 replicas: 1,
+                 sentinels: 1,
+                 sentinel_base_port: 26_470,
+                 password: nil
+               )
+
+      assert wait_until(
+               fn ->
+                 Enum.all?([6470, 6471, 26_470], &Cli.ping(Cli.new(port: &1)))
+               end,
+               10,
+               500
+             )
+
+      assert :ok = Manager.stop("demo-sentinel")
+
+      assert wait_until(
+               fn ->
+                 Enum.all?([6470, 6471, 26_470], &(not Cli.ping(Cli.new(port: &1))))
+               end,
+               10,
+               200
+             )
+    end
+  end
+
   describe "Cluster" do
     @tag timeout: 30_000
     test "start 3-master cluster, verify health, stop" do
       {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7100)
 
       assert Cluster.all_alive?(cluster)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end)
 
       info = Cluster.info(cluster)
       assert info.masters == 3
@@ -319,6 +443,7 @@ defmodule RedisServerWrapperTest do
 
       addr = Cluster.addr(cluster)
       assert addr == "127.0.0.1:7100"
+      assert {:error, :managed_server} = Cluster.detach(cluster)
 
       Cluster.stop(cluster)
       Process.sleep(1000)
@@ -329,7 +454,7 @@ defmodule RedisServerWrapperTest do
       {:ok, cluster} = Cluster.start_link(masters: 3, replicas_per_master: 1, base_port: 7200)
 
       assert Cluster.all_alive?(cluster)
-      assert Cluster.healthy?(cluster)
+      assert wait_until(fn -> Cluster.healthy?(cluster) end)
 
       info = Cluster.info(cluster)
       assert info.total_nodes == 6
@@ -359,6 +484,7 @@ defmodule RedisServerWrapperTest do
 
       assert {:ok, master_info} = Sentinel.poke(sentinel)
       assert master_info["flags"] == "master"
+      assert {:error, :managed_server} = Sentinel.detach(sentinel)
 
       Sentinel.stop(sentinel)
       Process.sleep(1000)
