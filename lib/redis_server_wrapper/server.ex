@@ -290,28 +290,33 @@ defmodule RedisServerWrapper.Server do
       "RedisServerWrapper.Server terminating, sending SHUTDOWN NOSAVE to port #{state.config.port}"
     )
 
-    Cli.shutdown(state.cli)
+    shutdown_if_owned(state)
     # Give it a moment to shut down
     Process.sleep(500)
+
+    managed_pid_owned = managed_port_owns_pid?(state.port_ref, state.pid)
 
     # Close the port if managed
     if state.port_ref && Port.info(state.port_ref) != nil do
       Port.close(state.port_ref)
     end
 
-    # Force kill if still alive.
-    # Use kill on the process group (-pid) to also catch child processes.
-    # This handles redis-stack-server (bash wrapper) which spawns a child redis-server.
-    if state.pid && OSProcess.alive?(state.pid) do
+    force_kill_pid =
+      cond do
+        managed_pid_owned -> state.pid
+        is_nil(state.port_ref) and pid_owns_port?(state.pid, state.config.port) -> state.pid
+        true -> nil
+      end
+
+    # Force kill only when ownership was re-established immediately before the
+    # signal. Use the process group to also catch children of a custom wrapper.
+    if force_kill_pid && OSProcess.alive?(force_kill_pid) do
       Logger.warning("redis-server PID #{state.pid} still alive after SHUTDOWN, sending SIGKILL")
       # Kill the process group (negative PID) to get wrapper + child
-      warn_if_signal_unavailable(OSProcess.signal(-state.pid, :kill), state.pid)
+      warn_if_signal_unavailable(OSProcess.signal(-force_kill_pid, :kill), force_kill_pid)
       # Also try the individual PID in case process group kill didn't work
-      warn_if_signal_unavailable(OSProcess.signal(state.pid, :kill), state.pid)
+      warn_if_signal_unavailable(OSProcess.signal(force_kill_pid, :kill), force_kill_pid)
     end
-
-    # Extra safety: find and kill any redis-server on our port
-    kill_by_port(state.config.port)
 
     :ok
   end
@@ -330,12 +335,6 @@ defmodule RedisServerWrapper.Server do
 
   # Port-based: redis-server runs in the foreground, tied to the BEAM.
   defp start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
-    # Check for stale process from a previous (possibly daemonized) run
-    stale_pidfile =
-      Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
-
-    kill_stale_process(stale_pidfile)
-
     with :ok <- check_port_available(config.bind, config.port) do
       do_start_managed(config, redis_server_bin, redis_cli_bin, timeout)
     end
@@ -413,11 +412,6 @@ defmodule RedisServerWrapper.Server do
   # where terminate/2 never runs.
   defp start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
     if forcola_available?() do
-      stale_pidfile =
-        Path.join([System.tmp_dir!(), "redis-server-wrapper", "node-#{config.port}", "redis.pid"])
-
-      kill_stale_process(stale_pidfile)
-
       with :ok <- check_port_available(config.bind, config.port) do
         do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
       end
@@ -595,36 +589,6 @@ defmodule RedisServerWrapper.Server do
     end
   end
 
-  defp kill_stale_process(pidfile_path) do
-    pidfile_path
-    |> read_pidfile()
-    |> maybe_kill_stale()
-  end
-
-  defp maybe_kill_stale(nil), do: :ok
-
-  defp maybe_kill_stale(stale_pid) do
-    # Only kill if the process is (a) alive and (b) actually orphaned
-    # (ppid=1). A prior daemonized run re-parents to init, so ppid=1 is
-    # the signal that this is truly stale. Any other parent means it is
-    # a managed Port child of some BEAM -- possibly our own -- and we
-    # must not kill it, or we'd murder a server that was just started on
-    # the same port by the same or a sibling process.
-    if OSProcess.alive?(stale_pid) and OSProcess.orphaned?(stale_pid) do
-      Logger.warning("Killing stale redis-server process #{stale_pid}")
-      warn_if_signal_unavailable(OSProcess.signal(stale_pid, :term), stale_pid)
-      Process.sleep(500)
-      force_kill_if_alive(stale_pid)
-    end
-  end
-
-  defp force_kill_if_alive(pid) do
-    if OSProcess.alive?(pid) do
-      Logger.warning("Stale PID #{pid} still alive, sending SIGKILL")
-      warn_if_signal_unavailable(OSProcess.signal(pid, :kill), pid)
-    end
-  end
-
   defp make_node_dir(port) do
     dir =
       Path.join([
@@ -665,23 +629,56 @@ defmodule RedisServerWrapper.Server do
     ArgumentError -> :ok
   end
 
-  # Kill any redis-server process listening on a specific port.
-  # This handles orphaned processes from wrapper scripts (redis-stack-server).
-  defp kill_by_port(port) when is_integer(port) do
-    case OSProcess.pids_on_port(port) do
-      {:ok, pids} ->
-        Enum.each(pids, fn pid ->
-          warn_if_signal_unavailable(OSProcess.signal(pid, :kill), pid)
-        end)
+  defp shutdown_if_owned(%{pid: nil}), do: :ok
 
-      {:error, {:executable_not_found, "lsof"}} ->
-        Logger.warning(
-          "lsof is unavailable; skipping best-effort process cleanup for Redis port #{port}"
-        )
+  defp shutdown_if_owned(state) do
+    if managed_port_owns_pid?(state.port_ref, state.pid) do
+      run_shutdown(state)
+    else
+      shutdown_if_listener_owned(state, OSProcess.pids_on_port(state.config.port))
     end
   end
 
-  defp kill_by_port(_), do: :ok
+  defp shutdown_if_listener_owned(state, {:ok, pids}) do
+    if state.pid in pids do
+      run_shutdown(state)
+    else
+      Logger.warning(
+        "Skipping Redis shutdown on port #{state.config.port}: " <>
+          "tracked PID #{state.pid} no longer owns the listener"
+      )
+    end
+  end
+
+  defp shutdown_if_listener_owned(state, {:error, {:executable_not_found, "lsof"}}) do
+    Logger.warning(
+      "lsof is unavailable; skipping ownership-sensitive Redis shutdown " <>
+        "on port #{state.config.port}"
+    )
+  end
+
+  defp run_shutdown(state) do
+    _result = Cli.run(state.cli, ["SHUTDOWN", "NOSAVE"])
+    :ok
+  end
+
+  defp managed_port_owns_pid?(port_ref, pid) when is_port(port_ref) and is_integer(pid) do
+    case :erlang.port_info(port_ref, :os_pid) do
+      {:os_pid, ^pid} -> true
+      _other -> false
+    end
+  end
+
+  defp managed_port_owns_pid?(_port_ref, _pid), do: false
+
+  defp pid_owns_port?(pid, port) when is_integer(pid) do
+    case OSProcess.pids_on_port(port) do
+      {:ok, pids} -> pid in pids
+      {:error, _reason} -> false
+    end
+  end
+
+  defp pid_owns_port?(_pid, _port), do: false
 
   defp warn_if_signal_unavailable(
          {:error, {:executable_not_found, "kill"}},

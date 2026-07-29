@@ -40,7 +40,7 @@ defmodule RedisServerWrapper.Cluster do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, OSProcess, Server}
+  alias RedisServerWrapper.{Cli, Server}
 
   require Logger
 
@@ -131,14 +131,10 @@ defmodule RedisServerWrapper.Cluster do
     extra = Keyword.get(opts, :extra, [])
     managed = Keyword.get(opts, :managed, true)
 
-    total_nodes = masters * (1 + replicas)
-    ports = Enum.map(0..(total_nodes - 1), &(base_port + &1))
-
-    # Pre-cleanup: try to shut down anything on these ports
-    cleanup_ports(ports, bind, redis_cli_bin, password)
-    Process.sleep(500)
-
-    node_opts = %{
+    settings = %{
+      masters: masters,
+      replicas_per_master: replicas,
+      base_port: base_port,
       bind: bind,
       password: password,
       redis_server_bin: redis_server_bin,
@@ -150,38 +146,9 @@ defmodule RedisServerWrapper.Cluster do
       managed: managed
     }
 
-    # Start each node as a Server GenServer
-    case start_nodes(ports, node_opts) do
-      {:ok, node_pids} ->
-        # Form the cluster
-        seed_cli = Cli.new(bin: redis_cli_bin, host: bind, port: base_port, password: password)
-        node_addr_list = Enum.map(ports, &"#{bind}:#{&1}")
-
-        case Cli.cluster_create(seed_cli, node_addr_list, replicas) do
-          {:ok, _output} ->
-            # Wait for cluster convergence
-            Process.sleep(2000)
-
-            state = %__MODULE__{
-              masters: masters,
-              replicas_per_master: replicas,
-              base_port: base_port,
-              bind: bind,
-              password: password,
-              redis_cli_bin: redis_cli_bin,
-              node_pids: node_pids
-            }
-
-            {:ok, state}
-
-          {:error, reason} ->
-            # Rollback: stop all nodes
-            Enum.each(node_pids, &Server.stop/1)
-            {:stop, {:cluster_create_failed, reason}}
-        end
-
-      {:error, reason} ->
-        {:stop, reason}
+    case validate_options(settings) do
+      :ok -> start_validated_cluster(settings)
+      {:error, reason} -> {:stop, reason}
     end
   end
 
@@ -283,6 +250,66 @@ defmodule RedisServerWrapper.Cluster do
   # Internal
   # -------------------------------------------------------------------
 
+  defp start_validated_cluster(settings) do
+    total_nodes = settings.masters * (1 + settings.replicas_per_master)
+    ports = ports_from(settings.base_port, total_nodes)
+
+    node_opts =
+      Map.take(settings, [
+        :bind,
+        :password,
+        :redis_server_bin,
+        :redis_cli_bin,
+        :timeout,
+        :cluster_node_timeout,
+        :loadmodule,
+        :extra,
+        :managed
+      ])
+
+    # Server startup fails closed if a requested port is already occupied;
+    # Cluster never shuts down or signals an existing listener to claim it.
+    case start_nodes(ports, node_opts) do
+      {:ok, node_pids} -> form_cluster(node_pids, ports, settings)
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  defp form_cluster(node_pids, ports, settings) do
+    seed_cli =
+      Cli.new(
+        bin: settings.redis_cli_bin,
+        host: settings.bind,
+        port: settings.base_port,
+        password: settings.password
+      )
+
+    node_addr_list = Enum.map(ports, &"#{settings.bind}:#{&1}")
+
+    case Cli.cluster_create(seed_cli, node_addr_list, settings.replicas_per_master) do
+      {:ok, _output} ->
+        # Wait for cluster convergence
+        Process.sleep(2000)
+
+        state = %__MODULE__{
+          masters: settings.masters,
+          replicas_per_master: settings.replicas_per_master,
+          base_port: settings.base_port,
+          bind: settings.bind,
+          password: settings.password,
+          redis_cli_bin: settings.redis_cli_bin,
+          node_pids: node_pids
+        }
+
+        {:ok, state}
+
+      {:error, reason} ->
+        # Rollback: stop all nodes
+        Enum.each(node_pids, &Server.stop/1)
+        {:stop, {:cluster_create_failed, reason}}
+    end
+  end
+
   defp start_nodes(ports, node_opts) do
     results =
       Enum.reduce_while(ports, {:ok, []}, fn port, {:ok, acc} ->
@@ -302,9 +329,6 @@ defmodule RedisServerWrapper.Cluster do
             save: :disabled
           ] ++ extra_to_opts(node_opts.extra)
 
-        # Clean any stale cluster config from previous runs
-        clean_node_dir(port)
-
         case Server.start_link(opts) do
           {:ok, pid} ->
             {:cont, {:ok, acc ++ [pid]}}
@@ -317,26 +341,6 @@ defmodule RedisServerWrapper.Cluster do
       end)
 
     results
-  end
-
-  defp cleanup_ports(ports, bind, redis_cli_bin, password) do
-    unless OSProcess.available?("lsof") do
-      Logger.warning(
-        "lsof is unavailable; Redis Cluster startup will skip best-effort forced port cleanup"
-      )
-    end
-
-    Enum.each(ports, fn port ->
-      # Try graceful shutdown first
-      cli = Cli.new(bin: redis_cli_bin, host: bind, port: port, password: password)
-      Cli.shutdown(cli)
-
-      # Force kill anything still on this port
-      case OSProcess.pids_on_port(port) do
-        {:ok, pids} -> Enum.each(pids, &OSProcess.signal(&1, :kill))
-        {:error, {:executable_not_found, "lsof"}} -> :ok
-      end
-    end)
   end
 
   defp seed_cli(state) do
@@ -370,33 +374,47 @@ defmodule RedisServerWrapper.Cluster do
     end)
   end
 
-  # Remove stale cluster config files from a node's data directory.
-  # These persist across runs and cause "Node is not empty" errors
-  # when trying to create a new cluster.
-  defp clean_node_dir(port) do
-    # Clean our temp dir
-    base = System.tmp_dir!()
-    node_dir = Path.join([base, "redis-server-wrapper", "node-#{port}"])
-    clean_cluster_files(node_dir, port)
+  defp validate_options(settings) do
+    with :ok <- positive_integer(:masters, settings.masters),
+         :ok <-
+           non_negative_integer(:replicas_per_master, settings.replicas_per_master),
+         :ok <- valid_port(:base_port, settings.base_port),
+         :ok <- positive_integer(:timeout, settings.timeout),
+         :ok <- positive_integer(:cluster_node_timeout, settings.cluster_node_timeout) do
+      total_nodes = settings.masters * (1 + settings.replicas_per_master)
+      last_data_port = settings.base_port + total_nodes - 1
+      first_bus_port = settings.base_port + 10_000
+      last_bus_port = last_data_port + 10_000
 
-    # Also clean redis-stack-server's default data dir.
-    # redis-stack-server writes cluster config to its own dir regardless of
-    # what `dir` is set to in our config.
-    stack_dir = "/opt/homebrew/var/db/redis-stack"
-    clean_cluster_files(stack_dir, port)
-  end
+      cond do
+        last_data_port > 65_535 ->
+          {:error, {:invalid_port_range, :cluster_nodes, settings.base_port, last_data_port}}
 
-  defp clean_cluster_files(dir, port) do
-    if File.dir?(dir) do
-      ["nodes-#{port}.conf", "nodes-*.conf", "dump.rdb", "appendonly.aof", "appendonlydir"]
-      |> Enum.flat_map(&Path.wildcard(Path.join(dir, &1)))
-      |> Enum.each(&remove_path/1)
+        last_data_port >= first_bus_port ->
+          {:error,
+           {:overlapping_port_ranges, :cluster_nodes, settings.base_port, last_data_port,
+            :cluster_bus, first_bus_port, last_bus_port}}
+
+        last_bus_port > 65_535 ->
+          {:error, {:invalid_port_range, :cluster_bus, first_bus_port, last_bus_port}}
+
+        true ->
+          :ok
+      end
     end
   end
 
-  defp remove_path(path) do
-    if File.dir?(path), do: File.rm_rf!(path), else: File.rm(path)
-  end
+  defp positive_integer(_key, value) when is_integer(value) and value > 0, do: :ok
+  defp positive_integer(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp non_negative_integer(_key, value) when is_integer(value) and value >= 0, do: :ok
+  defp non_negative_integer(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp valid_port(_key, value) when is_integer(value) and value in 1..65_535, do: :ok
+  defp valid_port(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp ports_from(_base_port, 0), do: []
+  defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
 
   defp extract_gen_opts(opts) do
     case Keyword.pop(opts, :name) do

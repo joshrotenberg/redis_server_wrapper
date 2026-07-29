@@ -261,6 +261,23 @@ defmodule RedisServerWrapperTest do
 
       assert :ok = Server.stop(server)
     end
+
+    test "stopping stale Server state does not stop a replacement listener" do
+      port = 6416
+      {:ok, stale_server} = Server.start(port: port)
+      stale_pid = Server.info(stale_server).pid
+      assert :ok = RedisServerWrapper.OSProcess.signal(stale_pid, :kill)
+      assert wait_until(fn -> not Server.alive?(stale_server) end, 20, 100)
+
+      {:ok, replacement_server} = Server.start_link(port: port)
+
+      try do
+        assert :ok = Server.stop(stale_server)
+        assert Server.ping(replacement_server)
+      after
+        if Process.alive?(replacement_server), do: Server.stop(replacement_server)
+      end
+    end
   end
 
   describe "Server forcola mode" do
@@ -440,6 +457,119 @@ defmodule RedisServerWrapperTest do
       assert Manager.list() == []
     end
 
+    test "stale Manager state never shuts down a foreign listener", %{state_file: state_file} do
+      port = 6485
+      {:ok, existing_server} = Server.start_link(port: port, save: :disabled)
+
+      write_manager_state(
+        state_file,
+        %{
+          "stale-basic" =>
+            manager_instance("stale-basic", "basic", "2026-01-01T00:00:00Z")
+            |> Map.put("ports", [port])
+        }
+      )
+
+      try do
+        assert :ok = Manager.stop("stale-basic")
+        assert Server.ping(existing_server)
+        assert Manager.list() == []
+      after
+        if Process.alive?(existing_server), do: Server.stop(existing_server)
+      end
+    end
+
+    test "Manager retains state when a live recorded PID cannot be tied to a listener", %{
+      state_file: state_file
+    } do
+      live_pid = System.pid() |> String.to_integer()
+
+      write_manager_state(
+        state_file,
+        %{
+          "unverified-basic" =>
+            manager_instance("unverified-basic", "basic", "2026-01-01T00:00:00Z")
+            |> Map.put("pids", [live_pid])
+        }
+      )
+
+      assert {:error, {:process_ownership_not_verified, "unverified-basic", [^live_pid]}} =
+               Manager.stop("unverified-basic")
+
+      assert [%{name: "unverified-basic"}] = Manager.list()
+
+      assert {:error,
+              {:instances_not_stopped,
+               %{
+                 "unverified-basic" =>
+                   {:process_ownership_not_verified, "unverified-basic", [^live_pid]}
+               }}} = Manager.stop_all()
+
+      assert [%{name: "unverified-basic"}] = Manager.list()
+    end
+
+    test "Manager refuses teardown when listener ownership cannot be inspected", %{
+      state_file: state_file
+    } do
+      write_manager_state(
+        state_file,
+        %{
+          "uninspectable-basic" =>
+            manager_instance("uninspectable-basic", "basic", "2026-01-01T00:00:00Z")
+            |> Map.put("ports", [6486])
+        }
+      )
+
+      original_path = System.get_env("PATH")
+      empty_path = Path.join(Path.dirname(state_file), "empty-path")
+      File.mkdir_p!(empty_path)
+      System.put_env("PATH", empty_path)
+
+      try do
+        assert {:error,
+                {:process_ownership_not_verified, "uninspectable-basic",
+                 {:executable_not_found, "lsof"}}} = Manager.stop("uninspectable-basic")
+      after
+        System.put_env("PATH", original_path)
+      end
+
+      assert [%{name: "uninspectable-basic"}] = Manager.list()
+    end
+
+    test "Manager signals only the recorded listener when graceful authentication fails", %{
+      state_file: state_file
+    } do
+      port = 6487
+
+      {:ok, server} =
+        Server.start_link(
+          port: port,
+          password: "actual-password",
+          managed: false,
+          save: :disabled
+        )
+
+      server_info = Server.info(server)
+
+      write_manager_state(
+        state_file,
+        %{
+          "owned-basic" =>
+            manager_instance("owned-basic", "basic", "2026-01-01T00:00:00Z")
+            |> Map.put("ports", [port])
+            |> Map.put("pids", [server_info.pid])
+            |> Map.put("password", "wrong-password")
+        }
+      )
+
+      try do
+        assert :ok = Manager.stop("owned-basic")
+        assert wait_until(fn -> not Server.alive?(server) end, 10, 200)
+      after
+        if Process.alive?(server), do: Server.stop(server)
+      end
+    end
+
     test "topology launchers preserve startup errors" do
       invalid_modules = [{"/missing/module.so", [:not_a_string]}]
 
@@ -526,6 +656,24 @@ defmodule RedisServerWrapperTest do
   end
 
   describe "Cluster" do
+    test "occupied node ports fail closed without stopping the existing server or deleting data" do
+      port = 7460
+      {:ok, existing_server} = Server.start_link(port: port, save: :disabled)
+      existing_info = Server.info(existing_server)
+      unrelated_dump = Path.join(existing_info.node_dir, "dump.rdb")
+      File.write!(unrelated_dump, "belongs to the existing server")
+
+      try do
+        assert {:error, {:node_start_failed, ^port, {:port_in_use, ^port, _reason}}} =
+                 Cluster.start(masters: 1, base_port: port)
+
+        assert Server.ping(existing_server)
+        assert File.read!(unrelated_dump) == "belongs to the existing server"
+      after
+        if Process.alive?(existing_server), do: Server.stop(existing_server)
+      end
+    end
+
     @tag timeout: 30_000
     test "start 3-master cluster, verify health, stop" do
       {:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7100)
@@ -563,6 +711,46 @@ defmodule RedisServerWrapperTest do
   end
 
   describe "Sentinel" do
+    test "occupied master port fails closed without stopping the existing server" do
+      master_port = 7470
+      {:ok, existing_server} = Server.start_link(port: master_port, save: :disabled)
+
+      try do
+        assert {:error, {:port_in_use, ^master_port, _reason}} =
+                 Sentinel.start(
+                   master_port: master_port,
+                   replicas: 0,
+                   sentinels: 1,
+                   sentinel_base_port: 27_470,
+                   quorum: 1
+                 )
+
+        assert Server.ping(existing_server)
+      after
+        if Process.alive?(existing_server), do: Server.stop(existing_server)
+      end
+    end
+
+    @tag timeout: 30_000
+    test "sentinel topology supports zero replicas without creating phantom ports" do
+      {:ok, sentinel} =
+        Sentinel.start_link(
+          master_port: 6510,
+          replicas: 0,
+          sentinels: 1,
+          sentinel_base_port: 26_510,
+          quorum: 1
+        )
+
+      try do
+        assert wait_until(fn -> Sentinel.healthy?(sentinel) end)
+        assert Sentinel.info(sentinel).replicas == 0
+        assert Sentinel.sentinel_addrs(sentinel) == ["127.0.0.1:26510"]
+      after
+        if Process.alive?(sentinel), do: Sentinel.stop(sentinel)
+      end
+    end
+
     @tag timeout: 30_000
     test "start sentinel topology, verify health, stop" do
       {:ok, sentinel} =

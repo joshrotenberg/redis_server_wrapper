@@ -116,7 +116,14 @@ defmodule RedisServerWrapper.Sentinel do
     master_name = Keyword.get(opts, :master_name, "mymaster")
     master_port = Keyword.get(opts, :master_port, 6390)
     num_replicas = Keyword.get(opts, :replicas, 2)
-    replica_base_port = Keyword.get(opts, :replica_base_port, master_port + 1)
+
+    replica_base_port =
+      case Keyword.fetch(opts, :replica_base_port) do
+        {:ok, port} -> port
+        :error when is_integer(master_port) -> master_port + 1
+        :error -> master_port
+      end
+
     num_sentinels = Keyword.get(opts, :sentinels, 3)
     sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     quorum = Keyword.get(opts, :quorum, 2)
@@ -133,15 +140,6 @@ defmodule RedisServerWrapper.Sentinel do
     loadmodule = Keyword.get(opts, :loadmodule, [])
     managed = Keyword.get(opts, :managed, true)
 
-    all_ports =
-      [master_port] ++
-        Enum.map(0..(num_replicas - 1), &(replica_base_port + &1)) ++
-        Enum.map(0..(num_sentinels - 1), &(sentinel_base_port + &1))
-
-    # Pre-cleanup
-    cleanup_ports(all_ports, bind, redis_cli_bin, password)
-    Process.sleep(500)
-
     node_opts = %{
       bind: bind,
       password: password,
@@ -152,7 +150,20 @@ defmodule RedisServerWrapper.Sentinel do
       managed: managed
     }
 
-    with {:ok, master_pid} <- start_master(master_port, node_opts),
+    validation_settings = %{
+      master_port: master_port,
+      replicas: num_replicas,
+      replica_base_port: replica_base_port,
+      sentinels: num_sentinels,
+      sentinel_base_port: sentinel_base_port,
+      quorum: quorum,
+      down_after_ms: down_after_ms,
+      failover_timeout_ms: failover_timeout_ms,
+      timeout: timeout
+    }
+
+    with :ok <- validate_options(validation_settings),
+         {:ok, master_pid} <- start_master(master_port, node_opts),
          {:ok, replica_pids} <-
            start_replicas(num_replicas, replica_base_port, master_port, node_opts),
          # Let replication link up
@@ -175,7 +186,7 @@ defmodule RedisServerWrapper.Sentinel do
       # Wait for sentinel discovery
       Process.sleep(2000)
 
-      sentinel_ports = Enum.map(0..(num_sentinels - 1), &(sentinel_base_port + &1))
+      sentinel_ports = ports_from(sentinel_base_port, num_sentinels)
 
       state = %__MODULE__{
         master_name: master_name,
@@ -487,12 +498,65 @@ defmodule RedisServerWrapper.Sentinel do
     end
   end
 
-  defp cleanup_ports(ports, bind, redis_cli_bin, password) do
-    Enum.each(ports, fn port ->
-      cli = Cli.new(bin: redis_cli_bin, host: bind, port: port, password: password)
-      Cli.shutdown(cli)
-    end)
+  defp validate_options(settings) do
+    with :ok <- valid_port(:master_port, settings.master_port),
+         :ok <- non_negative_integer(:replicas, settings.replicas),
+         :ok <- positive_integer(:sentinels, settings.sentinels),
+         :ok <- valid_port(:sentinel_base_port, settings.sentinel_base_port),
+         :ok <- positive_integer(:quorum, settings.quorum),
+         :ok <- quorum_within_sentinel_count(settings.quorum, settings.sentinels),
+         :ok <- positive_integer(:down_after_ms, settings.down_after_ms),
+         :ok <- positive_integer(:failover_timeout_ms, settings.failover_timeout_ms),
+         :ok <- positive_integer(:timeout, settings.timeout),
+         :ok <-
+           valid_port_span(:replicas, settings.replica_base_port, settings.replicas),
+         :ok <-
+           valid_port_span(:sentinels, settings.sentinel_base_port, settings.sentinels) do
+      all_ports =
+        [settings.master_port] ++
+          ports_from(settings.replica_base_port, settings.replicas) ++
+          ports_from(settings.sentinel_base_port, settings.sentinels)
+
+      if MapSet.size(MapSet.new(all_ports)) == length(all_ports) do
+        :ok
+      else
+        {:error, {:overlapping_ports, all_ports}}
+      end
+    end
   end
+
+  defp positive_integer(_key, value) when is_integer(value) and value > 0, do: :ok
+  defp positive_integer(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp non_negative_integer(_key, value) when is_integer(value) and value >= 0, do: :ok
+  defp non_negative_integer(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp valid_port(_key, value) when is_integer(value) and value in 1..65_535, do: :ok
+  defp valid_port(key, value), do: {:error, {:invalid_option, key, value}}
+
+  defp quorum_within_sentinel_count(quorum, sentinels) when quorum <= sentinels, do: :ok
+
+  defp quorum_within_sentinel_count(quorum, sentinels),
+    do: {:error, {:invalid_quorum, quorum, sentinels}}
+
+  defp valid_port_span(_key, _base_port, 0), do: :ok
+
+  defp valid_port_span(key, base_port, count)
+       when is_integer(base_port) and base_port in 1..65_535 do
+    last_port = base_port + count - 1
+
+    if last_port <= 65_535 do
+      :ok
+    else
+      {:error, {:invalid_port_range, key, base_port, last_port}}
+    end
+  end
+
+  defp valid_port_span(key, base_port, _count),
+    do: {:error, {:invalid_option, :"#{key}_base_port", base_port}}
+
+  defp ports_from(_base_port, 0), do: []
+  defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
 
   defp detach_servers(servers) do
     Enum.reduce_while(servers, :ok, fn server, :ok ->
