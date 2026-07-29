@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.2...v0.7.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* tolerate missing process utilities ([#50](https://github.com/joshrotenberg/redis_server_wrapper/issues/50)) ([0b1e5c7](https://github.com/joshrotenberg/redis_server_wrapper/commit/0b1e5c77a724ad9eea700ee68eef4ede577a35f9))
+
 ## [0.7.2](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.1...v0.7.2) (2026-07-29)
 
 
