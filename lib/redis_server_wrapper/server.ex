@@ -267,9 +267,18 @@ defmodule RedisServerWrapper.Server do
   def handle_info({:EXIT, daemon, reason}, %{daemon: daemon} = state) when is_pid(daemon) do
     # The Forcola.Daemon child exited (redis-server died on its own). Forcola
     # maps the child exit to :normal / {:exit_status, n} / {:exit_signal, n};
-    # translate it into a GenServer stop so an OTP restart strategy behaves.
-    Logger.info("Managed (forcola) redis-server exited: #{inspect(reason)}")
-    {:stop, reason, %{state | daemon: nil, pid: nil}}
+    # translate every unexpected child exit into an abnormal GenServer stop so
+    # both permanent and transient OTP children restart consistently.
+    stop_reason = {:redis_server_exit, :forcola, reason}
+    Logger.warning("Managed (forcola) redis-server exited: #{inspect(reason)}")
+    {:stop, stop_reason, %{state | daemon: nil, pid: nil}}
+  end
+
+  def handle_info({:EXIT, port_ref, reason}, %{port_ref: port_ref} = state)
+      when is_port(port_ref) do
+    stop_reason = {:redis_server_exit, :port, reason}
+    Logger.warning("Managed redis-server port exited: #{inspect(reason)}")
+    {:stop, stop_reason, %{state | port_ref: nil, pid: nil}}
   end
 
   def handle_info({:EXIT, _port, _reason}, state) do
@@ -279,8 +288,9 @@ defmodule RedisServerWrapper.Server do
 
   def handle_info({port_ref, {:exit_status, status}}, %{port_ref: port_ref} = state)
       when is_port(port_ref) do
-    Logger.info("Managed redis-server exited with status #{status}")
-    {:noreply, %{state | port_ref: nil, pid: nil}}
+    stop_reason = {:redis_server_exit, :port, {:exit_status, status}}
+    Logger.warning("Managed redis-server exited with status #{status}")
+    {:stop, stop_reason, %{state | port_ref: nil, pid: nil}}
   end
 
   def handle_info({port_ref, {:data, {:eol, line}}}, %{port_ref: port_ref} = state)
@@ -305,6 +315,12 @@ defmodule RedisServerWrapper.Server do
     )
 
     stop_daemon(daemon)
+    :ok
+  end
+
+  def terminate(_reason, %{managed: managed, daemon: nil, port_ref: nil, pid: nil})
+      when managed in [true, :forcola] do
+    Logger.debug("RedisServerWrapper.Server terminating after managed redis-server exit")
     :ok
   end
 

@@ -1,7 +1,16 @@
 defmodule RedisServerWrapperTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, Config, Connection, Manager, Sentinel, Server}
+  alias RedisServerWrapper.{
+    Cli,
+    Cluster,
+    Config,
+    Connection,
+    Manager,
+    OSProcess,
+    Sentinel,
+    Server
+  }
 
   setup_all do
     tls_dir =
@@ -35,6 +44,44 @@ defmodule RedisServerWrapperTest do
       {out, 0} -> out |> String.split("\n", trim: true)
       _ -> []
     end
+  end
+
+  defp redis_cli_wrapper!(dir, mode) do
+    path = Path.join(dir, "redis-cli-#{mode}")
+
+    body =
+      case mode do
+        :malformed_cluster_info ->
+          """
+          #!/bin/sh
+          case " $* " in
+            *" CLUSTER INFO "*) printf 'cluster_state:ok\\ncluster_slots_assigned:not-a-number\\n'; exit 0 ;;
+            *) exec redis-cli "$@" ;;
+          esac
+          """
+
+        :malformed_sentinel_master ->
+          """
+          #!/bin/sh
+          case " $* " in
+            *" SENTINEL MASTER "*) printf 'flags\\nmaster\\nnum-slaves\\nnot-a-number\\n'; exit 0 ;;
+            *) exec redis-cli "$@" ;;
+          esac
+          """
+
+        :malformed_replication_info ->
+          """
+          #!/bin/sh
+          case " $* " in
+            *" INFO replication "*) printf 'role:slave\\nmaster_link_status:down\\nmaster_port:bad\\n'; exit 0 ;;
+            *) exec redis-cli "$@" ;;
+          esac
+          """
+      end
+
+    File.write!(path, body)
+    File.chmod!(path, 0o700)
+    path
   end
 
   # -------------------------------------------------------------------
@@ -486,21 +533,50 @@ defmodule RedisServerWrapperTest do
       assert :ok = Server.stop(server)
     end
 
-    test "stopping stale Server state does not stop a replacement listener" do
+    test "managed Server exits when Redis dies and the endpoint can be reused" do
       port = 6416
       {:ok, stale_server} = Server.start(port: port)
       stale_pid = Server.info(stale_server).pid
+      monitor = Process.monitor(stale_server)
+
       assert :ok = RedisServerWrapper.OSProcess.signal(stale_pid, :kill)
-      assert wait_until(fn -> not Server.alive?(stale_server) end, 20, 100)
+
+      assert_receive {:DOWN, ^monitor, :process, ^stale_server, {:redis_server_exit, :port, _}},
+                     5_000
 
       {:ok, replacement_server} = Server.start_link(port: port)
 
       try do
-        assert :ok = Server.stop(stale_server)
         assert Server.ping(replacement_server)
       after
         if Process.alive?(replacement_server), do: Server.stop(replacement_server)
       end
+    end
+
+    test "an OTP supervisor restarts Server after the managed Redis process dies" do
+      port = 6417
+      {:ok, supervisor} = Supervisor.start_link([{Server, [port: port]}], strategy: :one_for_one)
+
+      [{_id, original_server, :worker, _modules}] = Supervisor.which_children(supervisor)
+      original_os_pid = Server.info(original_server).pid
+      assert :ok = RedisServerWrapper.OSProcess.signal(original_os_pid, :kill)
+
+      assert wait_until(
+               fn ->
+                 case Supervisor.which_children(supervisor) do
+                   [{_id, restarted_server, :worker, _modules}]
+                   when is_pid(restarted_server) and restarted_server != original_server ->
+                     Server.ping(restarted_server)
+
+                   _other ->
+                     false
+                 end
+               end,
+               50,
+               100
+             )
+
+      Supervisor.stop(supervisor)
     end
   end
 
@@ -1050,6 +1126,67 @@ defmodule RedisServerWrapperTest do
       end
     end
 
+    test "partial node startup rolls back nodes already started" do
+      base_port = 7465
+      occupied_port = base_port + 1
+      {:ok, existing_server} = Server.start_link(port: occupied_port, save: :disabled)
+
+      try do
+        assert {:error,
+                {:node_start_failed, ^occupied_port, {:port_in_use, ^occupied_port, _reason}}} =
+                 Cluster.start(masters: 3, base_port: base_port)
+
+        refute Cli.ping(Cli.new(port: base_port))
+        assert Server.ping(existing_server)
+      after
+        if Process.alive?(existing_server), do: Server.stop(existing_server)
+      end
+    end
+
+    @tag timeout: 30_000
+    test "a hard-dead cluster node leaves an explicit degraded topology" do
+      {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7480)
+      assert Cluster.healthy?(cluster)
+
+      [_first, victim | _rest] = Cluster.nodes(cluster)
+      victim_os_pid = Server.info(victim).pid
+      assert :ok = RedisServerWrapper.OSProcess.signal(victim_os_pid, :kill)
+
+      assert wait_until(fn -> not Process.alive?(victim) end, 50, 100)
+      assert Process.alive?(cluster)
+      refute Cluster.all_alive?(cluster)
+      refute Cluster.healthy?(cluster)
+      assert length(Cluster.nodes(cluster)) == 2
+
+      Cluster.stop(cluster)
+    end
+
+    @tag timeout: 30_000
+    test "cluster convergence timeout is actionable and rolls back every node" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "redis-server-wrapper-cli-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      cli = redis_cli_wrapper!(temp_dir, :malformed_cluster_info)
+
+      try do
+        assert {:error, {:cluster_convergence_timeout, 200, _last_health}} =
+                 Cluster.start(
+                   masters: 3,
+                   base_port: 7490,
+                   redis_cli_bin: cli,
+                   convergence_timeout: 200
+                 )
+
+        assert Enum.all?(7490..7492, &(not Cli.ping(Cli.new(port: &1))))
+      after
+        File.rm_rf!(temp_dir)
+      end
+    end
+
     @tag timeout: 30_000
     test "start 3-master cluster, verify health, stop" do
       {:ok, cluster} =
@@ -1138,6 +1275,264 @@ defmodule RedisServerWrapperTest do
         assert Server.ping(existing_server)
       after
         if Process.alive?(existing_server), do: Server.stop(existing_server)
+      end
+    end
+
+    @tag timeout: 30_000
+    test "a supervisor restarts Sentinel after a hard-dead control process" do
+      child =
+        {Sentinel,
+         [
+           master_port: 6530,
+           replicas: 0,
+           sentinels: 1,
+           sentinel_base_port: 26_530,
+           quorum: 1
+         ]}
+
+      {:ok, supervisor} = Supervisor.start_link([child], strategy: :one_for_one)
+      [{_id, sentinel, :worker, _modules}] = Supervisor.which_children(supervisor)
+
+      monitor = Process.monitor(sentinel)
+      [control] = :sys.get_state(sentinel).sentinel_processes
+      assert is_pid(control.owner)
+      assert is_integer(control.os_pid)
+      assert :ok = RedisServerWrapper.OSProcess.signal(control.os_pid, :kill)
+
+      assert_receive {:DOWN, ^monitor, :process, ^sentinel,
+                      {:sentinel_control_exit, 26_530, _reason}},
+                     5_000
+
+      assert wait_until(
+               fn ->
+                 case Supervisor.which_children(supervisor) do
+                   [{_id, restarted, :worker, _modules}]
+                   when is_pid(restarted) and restarted != sentinel ->
+                     Sentinel.healthy?(restarted)
+
+                   _other ->
+                     false
+                 end
+               end,
+               50,
+               100
+             )
+
+      Supervisor.stop(supervisor)
+    end
+
+    @tag timeout: 30_000
+    test "a hard-dead Sentinel data node fails and cleans up the topology" do
+      {:ok, sentinel} =
+        Sentinel.start(
+          master_port: 6535,
+          replicas: 1,
+          replica_base_port: 6536,
+          sentinels: 1,
+          sentinel_base_port: 26_535,
+          quorum: 1
+        )
+
+      monitor = Process.monitor(sentinel)
+      [replica] = :sys.get_state(sentinel).replica_pids
+      replica_os_pid = Server.info(replica).pid
+      assert :ok = RedisServerWrapper.OSProcess.signal(replica_os_pid, :kill)
+
+      assert_receive {:DOWN, ^monitor, :process, ^sentinel,
+                      {:sentinel_data_node_exit, :replica, 6536, _reason}},
+                     5_000
+
+      assert wait_until(
+               fn ->
+                 Enum.all?([6535, 6536, 26_535], &(not Cli.ping(Cli.new(port: &1))))
+               end,
+               30,
+               100
+             )
+    end
+
+    @tag timeout: 30_000
+    test "a hard-dead Sentinel master fails the topology coherently" do
+      {:ok, sentinel} =
+        Sentinel.start(
+          master_port: 6565,
+          replicas: 0,
+          sentinels: 1,
+          sentinel_base_port: 26_565,
+          quorum: 1
+        )
+
+      monitor = Process.monitor(sentinel)
+      master = :sys.get_state(sentinel).master_pid
+      master_os_pid = Server.info(master).pid
+      assert :ok = OSProcess.signal(master_os_pid, :kill)
+
+      assert_receive {:DOWN, ^monitor, :process, ^sentinel,
+                      {:sentinel_data_node_exit, :master, 6565, _reason}},
+                     5_000
+
+      assert wait_until(
+               fn ->
+                 not Cli.ping(Cli.new(port: 6565)) and
+                   not Cli.ping(Cli.new(port: 26_565))
+               end,
+               30,
+               100
+             )
+    end
+
+    @tag timeout: 30_000
+    test "Sentinel control processes honor the Forcola backend" do
+      {:ok, sentinel} =
+        Sentinel.start_link(
+          master_port: 6538,
+          replicas: 0,
+          sentinels: 1,
+          sentinel_base_port: 26_538,
+          quorum: 1,
+          managed: :forcola
+        )
+
+      state = :sys.get_state(sentinel)
+      [control] = state.sentinel_processes
+      assert control.managed == :forcola
+      assert Process.alive?(control.owner)
+      assert Sentinel.healthy?(sentinel)
+
+      Sentinel.stop(sentinel)
+      assert wait_until(fn -> not Cli.ping(Cli.new(port: 26_538)) end, 20, 100)
+    end
+
+    @tag timeout: 30_000
+    test "managed false daemonizes Sentinel controls and normal stop reaps them" do
+      {:ok, sentinel} =
+        Sentinel.start_link(
+          master_port: 6545,
+          replicas: 0,
+          sentinels: 1,
+          sentinel_base_port: 26_545,
+          quorum: 1,
+          managed: false
+        )
+
+      [control] = :sys.get_state(sentinel).sentinel_processes
+      assert control.managed == false
+      assert is_nil(control.owner)
+      assert OSProcess.alive?(control.os_pid)
+
+      Sentinel.stop(sentinel)
+
+      assert wait_until(
+               fn ->
+                 not OSProcess.alive?(control.os_pid) and
+                   not Cli.ping(Cli.new(port: 6545))
+               end,
+               30,
+               100
+             )
+    end
+
+    @tag timeout: 30_000
+    test "replication convergence timeout is actionable and rolls back data nodes" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "redis-server-wrapper-cli-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      cli = redis_cli_wrapper!(temp_dir, :malformed_replication_info)
+
+      try do
+        assert {:error, {:replication_convergence_timeout, 200, _last_health}} =
+                 Sentinel.start(
+                   master_port: 6550,
+                   replicas: 1,
+                   replica_base_port: 6551,
+                   sentinels: 1,
+                   sentinel_base_port: 26_550,
+                   quorum: 1,
+                   redis_cli_bin: cli,
+                   convergence_timeout: 200
+                 )
+
+        assert Enum.all?([6550, 6551, 26_550], &(not Cli.ping(Cli.new(port: &1))))
+      after
+        File.rm_rf!(temp_dir)
+      end
+    end
+
+    @tag timeout: 30_000
+    test "Sentinel control startup failure rolls back its data node" do
+      fixture_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "redis-server-wrapper-server-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(fixture_dir)
+
+      redis_server =
+        Path.join(fixture_dir, "redis-server-fail-sentinel")
+
+      File.write!(
+        redis_server,
+        """
+        #!/bin/sh
+        for arg in "$@"; do
+          if [ "$arg" = "--sentinel" ]; then
+            exit 42
+          fi
+        done
+        exec redis-server "$@"
+        """
+      )
+
+      File.chmod!(redis_server, 0o700)
+
+      try do
+        assert {:error, {:sentinel_start_failed, 26_560, _reason}} =
+                 Sentinel.start(
+                   master_port: 6560,
+                   replicas: 0,
+                   sentinels: 1,
+                   sentinel_base_port: 26_560,
+                   quorum: 1,
+                   redis_server_bin: redis_server
+                 )
+
+        assert wait_until(fn -> not Cli.ping(Cli.new(port: 6560)) end, 20, 100)
+      after
+        File.rm_rf!(fixture_dir)
+      end
+    end
+
+    @tag timeout: 30_000
+    test "Sentinel convergence timeout handles malformed health and rolls back" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "redis-server-wrapper-cli-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      cli = redis_cli_wrapper!(temp_dir, :malformed_sentinel_master)
+
+      try do
+        assert {:error, {:sentinel_convergence_timeout, 200, _last_health}} =
+                 Sentinel.start(
+                   master_port: 6540,
+                   replicas: 0,
+                   sentinels: 1,
+                   sentinel_base_port: 26_540,
+                   quorum: 1,
+                   redis_cli_bin: cli,
+                   convergence_timeout: 200
+                 )
+
+        assert Enum.all?([6540, 26_540], &(not Cli.ping(Cli.new(port: &1))))
+      after
+        File.rm_rf!(temp_dir)
       end
     end
 

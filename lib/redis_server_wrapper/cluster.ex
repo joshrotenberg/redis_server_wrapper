@@ -39,6 +39,8 @@ defmodule RedisServerWrapper.Cluster do
     * `:redis_cli_bin` - redis-cli binary path
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * `:timeout` - startup timeout per node in ms (default: 10_000)
+    * `:convergence_timeout` - bounded wait for every node to agree on the
+      cluster topology (default: the value of `:timeout`)
     * `:cluster_node_timeout` - cluster node timeout in ms (default: 5000)
     * `:loadmodule` - modules loaded into every cluster node; accepts paths or
       `{path, [args]}` tuples (default: `[]`)
@@ -65,6 +67,7 @@ defmodule RedisServerWrapper.Cluster do
     :password,
     :redis_cli_bin,
     node_pids: [],
+    node_ports: %{},
     detached: false
   ]
 
@@ -96,11 +99,14 @@ defmodule RedisServerWrapper.Cluster do
   @spec nodes(GenServer.server()) :: [pid()]
   def nodes(server), do: GenServer.call(server, :nodes)
 
-  @doc "Checks if all nodes respond to PING."
+  @doc "Checks if every tracked node process is alive and responds to PING."
   @spec all_alive?(GenServer.server()) :: boolean()
   def all_alive?(server), do: GenServer.call(server, :all_alive?)
 
-  @doc "Checks cluster health via CLUSTER INFO (state=ok, all slots assigned)."
+  @doc """
+  Checks every node's `CLUSTER INFO`, including state, slots, failures,
+  expected node count, and expected master count.
+  """
   @spec healthy?(GenServer.server()) :: boolean()
   def healthy?(server), do: GenServer.call(server, :healthy?)
 
@@ -142,6 +148,7 @@ defmodule RedisServerWrapper.Cluster do
     distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
+    convergence_timeout = Keyword.get(opts, :convergence_timeout, timeout)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
     loadmodule = Keyword.get(opts, :loadmodule, [])
     extra = Keyword.get(opts, :extra, [])
@@ -178,6 +185,7 @@ defmodule RedisServerWrapper.Cluster do
            redis_server_bin: redis_server_bin,
            redis_cli_bin: redis_cli_bin,
            timeout: timeout,
+           convergence_timeout: convergence_timeout,
            cluster_node_timeout: cluster_node_timeout,
            loadmodule: loadmodule,
            extra: extra,
@@ -211,22 +219,23 @@ defmodule RedisServerWrapper.Cluster do
   end
 
   def handle_call(:all_alive?, _from, state) do
-    all = Enum.all?(state.node_pids, &Server.ping/1)
+    expected_nodes = state.masters * (1 + state.replicas_per_master)
+
+    all =
+      length(state.node_pids) == expected_nodes and
+        Enum.all?(state.node_pids, &safe_server_ping/1)
+
     {:reply, all, state}
   end
 
   def handle_call(:healthy?, _from, state) do
-    seed_cli = seed_cli(state)
+    expected_nodes = state.masters * (1 + state.replicas_per_master)
 
     result =
-      case Cli.cluster_info(seed_cli) do
-        {:ok, info} ->
-          info["cluster_state"] == "ok" &&
-            info["cluster_slots_assigned"] == "16384"
-
-        _ ->
-          false
-      end
+      match?(
+        {:ok, _snapshot},
+        cluster_health(state.node_pids, state.masters, expected_nodes)
+      )
 
     {:reply, result, state}
   end
@@ -263,11 +272,24 @@ defmodule RedisServerWrapper.Cluster do
 
   @impl true
   def handle_info({:EXIT, pid, reason}, state) do
-    if pid in state.node_pids and reason != :normal do
-      Logger.warning("Cluster node #{inspect(pid)} exited: #{inspect(reason)}")
-    end
+    case Enum.find_index(state.node_pids, &(&1 == pid)) do
+      nil ->
+        {:noreply, state}
 
-    {:noreply, state}
+      index ->
+        port = Map.get(state.node_ports, pid, state.base_port + index)
+
+        Logger.warning(
+          "Cluster node on port #{port} exited; topology is degraded: #{inspect(reason)}"
+        )
+
+        {:noreply,
+         %{
+           state
+           | node_pids: List.delete(state.node_pids, pid),
+             node_ports: Map.delete(state.node_ports, pid)
+         }}
+    end
   end
 
   @impl true
@@ -316,6 +338,7 @@ defmodule RedisServerWrapper.Cluster do
         :redis_server_bin,
         :redis_cli_bin,
         :timeout,
+        :convergence_timeout,
         :cluster_node_timeout,
         :loadmodule,
         :extra,
@@ -337,27 +360,36 @@ defmodule RedisServerWrapper.Cluster do
 
     case Cli.cluster_create(seed_cli, node_addr_list, settings.replicas_per_master) do
       {:ok, _output} ->
-        # Wait for cluster convergence
-        Process.sleep(2000)
+        case await_cluster_convergence(
+               node_pids,
+               settings.masters,
+               settings.convergence_timeout
+             ) do
+          {:ok, _snapshot} ->
+            {:ok,
+             %__MODULE__{
+               masters: settings.masters,
+               replicas_per_master: settings.replicas_per_master,
+               base_port: settings.base_port,
+               bind: settings.bind,
+               control_host: settings.control_host,
+               connection: settings.connection,
+               username: settings.username,
+               password: settings.password,
+               redis_cli_bin: settings.redis_cli_bin,
+               node_pids: node_pids,
+               node_ports: Map.new(Enum.zip(node_pids, ports))
+             }}
 
-        state = %__MODULE__{
-          masters: settings.masters,
-          replicas_per_master: settings.replicas_per_master,
-          base_port: settings.base_port,
-          bind: settings.bind,
-          control_host: settings.control_host,
-          connection: settings.connection,
-          username: settings.username,
-          password: settings.password,
-          redis_cli_bin: settings.redis_cli_bin,
-          node_pids: node_pids
-        }
+          {:error, last_health} ->
+            stop_servers(node_pids)
 
-        {:ok, state}
+            {:stop, {:cluster_convergence_timeout, settings.convergence_timeout, last_health}}
+        end
 
       {:error, reason} ->
         # Rollback: stop all nodes
-        Enum.each(node_pids, &Server.stop/1)
+        stop_servers(node_pids)
         {:stop, {:cluster_create_failed, reason}}
     end
   end
@@ -389,12 +421,16 @@ defmodule RedisServerWrapper.Cluster do
 
           {:error, reason} ->
             # Rollback already-started nodes
-            Enum.each(acc, &Server.stop/1)
+            stop_servers(acc)
             {:halt, {:error, {:node_start_failed, port, reason}}}
         end
       end)
 
     results
+  end
+
+  defp seed_cli(%{node_pids: [server | _rest]}) do
+    Server.cli(server)
   end
 
   defp seed_cli(state) do
@@ -504,12 +540,113 @@ defmodule RedisServerWrapper.Cluster do
     end)
   end
 
+  defp await_cluster_convergence(node_pids, masters, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_cluster_convergence(node_pids, masters, deadline, nil)
+  end
+
+  defp do_await_cluster_convergence(node_pids, masters, deadline, _last_health) do
+    case cluster_health(node_pids, masters, length(node_pids)) do
+      {:ok, _snapshot} = healthy ->
+        healthy
+
+      {:error, _reason} = unhealthy ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          unhealthy
+        else
+          Process.sleep(100)
+          do_await_cluster_convergence(node_pids, masters, deadline, unhealthy)
+        end
+    end
+  end
+
+  defp cluster_health(node_pids, masters, expected_nodes)
+       when length(node_pids) == expected_nodes do
+    node_pids
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {pid, index}, {:ok, snapshots} ->
+      with {:ok, cli} <- safe_server_cli(pid),
+           true <- Cli.ping(cli),
+           {:ok, info} <- Cli.cluster_info(cli),
+           :ok <- valid_cluster_info(info, expected_nodes, masters) do
+        {:cont, {:ok, [info | snapshots]}}
+      else
+        false ->
+          {:halt, {:error, {:node_unreachable, index}}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:node_health_failed, index, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, snapshots} -> {:ok, Enum.reverse(snapshots)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cluster_health(node_pids, _masters, expected_nodes),
+    do: {:error, {:unexpected_node_count, expected_nodes, length(node_pids)}}
+
+  defp valid_cluster_info(info, expected_nodes, masters) do
+    expected = %{
+      "cluster_state" => "ok",
+      "cluster_slots_assigned" => 16_384,
+      "cluster_slots_ok" => 16_384,
+      "cluster_slots_pfail" => 0,
+      "cluster_slots_fail" => 0,
+      "cluster_known_nodes" => expected_nodes,
+      "cluster_size" => masters
+    }
+
+    invalid =
+      Enum.reduce(expected, %{}, fn
+        {"cluster_state" = key, value}, acc ->
+          if Map.get(info, key) == value,
+            do: acc,
+            else: Map.put(acc, key, Map.get(info, key))
+
+        {key, value}, acc ->
+          case parse_integer(Map.get(info, key)) do
+            {:ok, ^value} -> acc
+            _other -> Map.put(acc, key, Map.get(info, key))
+          end
+      end)
+
+    if map_size(invalid) == 0 do
+      :ok
+    else
+      {:error, {:invalid_cluster_info, invalid}}
+    end
+  end
+
+  defp safe_server_cli(server) do
+    {:ok, Server.cli(server)}
+  catch
+    :exit, reason -> {:error, {:server_exit, reason}}
+  end
+
+  defp safe_server_ping(server) do
+    Server.ping(server)
+  catch
+    :exit, _reason -> false
+  end
+
+  defp parse_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> {:ok, integer}
+      _other -> :error
+    end
+  end
+
+  defp parse_integer(_value), do: :error
+
   defp validate_options(settings) do
     with :ok <- positive_integer(:masters, settings.masters),
          :ok <-
            non_negative_integer(:replicas_per_master, settings.replicas_per_master),
          :ok <- valid_port(:base_port, settings.base_port),
          :ok <- positive_integer(:timeout, settings.timeout),
+         :ok <- positive_integer(:convergence_timeout, settings.convergence_timeout),
          :ok <- positive_integer(:cluster_node_timeout, settings.cluster_node_timeout) do
       total_nodes = settings.masters * (1 + settings.replicas_per_master)
       last_data_port = settings.base_port + total_nodes - 1
