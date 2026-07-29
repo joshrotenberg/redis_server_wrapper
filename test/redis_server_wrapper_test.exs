@@ -241,6 +241,26 @@ defmodule RedisServerWrapperTest do
       Server.stop(server)
       Process.sleep(500)
     end
+
+    test "managed server can restart immediately after a client connection" do
+      {:ok, server} = Server.start_link(port: 6414)
+
+      assert {:ok, "OK"} = Server.run(server, ["SET", "restart_key", "restart_val"])
+      assert :ok = Server.stop(server)
+
+      assert {:ok, restarted} = Server.start_link(port: 6414)
+      assert Server.ping(restarted)
+      assert :ok = Server.stop(restarted)
+    end
+
+    test "managed server still rejects a port with a live listener" do
+      {:ok, server} = Server.start_link(port: 6415)
+
+      assert {:error, {:port_in_use, 6415, _reason}} =
+               Server.start(port: 6415)
+
+      assert :ok = Server.stop(server)
+    end
   end
 
   describe "Server forcola mode" do

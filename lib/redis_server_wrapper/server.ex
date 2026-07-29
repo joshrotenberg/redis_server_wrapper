@@ -570,7 +570,14 @@ defmodule RedisServerWrapper.Server do
   defp check_port_available(bind, port) do
     case :inet.parse_address(to_charlist(bind)) do
       {:ok, ip} ->
-        case :gen_tcp.listen(port, [:binary, {:ip, ip}, {:active, false}]) do
+        # Match Redis's address-reuse behavior so a recently closed client
+        # connection does not make this preflight report a false :eaddrinuse.
+        case :gen_tcp.listen(port, [
+               :binary,
+               {:ip, ip},
+               {:active, false},
+               {:reuseaddr, true}
+             ]) do
           {:ok, sock} ->
             :gen_tcp.close(sock)
             :ok
