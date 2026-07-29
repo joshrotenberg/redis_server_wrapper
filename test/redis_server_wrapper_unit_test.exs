@@ -1,7 +1,7 @@
 defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
-  alias RedisServerWrapper.{Cli, Cluster, OSProcess, Sentinel, Server}
+  alias RedisServerWrapper.{Cli, Cluster, OSProcess, SecureFile, Sentinel, Server}
 
   setup do
     fixture_dir =
@@ -49,6 +49,7 @@ defmodule RedisServerWrapperUnitTest do
               *) echo "connection-refused"; exit 2 ;;
             esac
             ;;
+          *"SHOW_AUTH"*) printf 'auth=%s args=%s\n' "$REDISCLI_AUTH" "$args" ;;
           *"FAIL"*) echo "failure"; exit 2 ;;
           *) echo "$args" ;;
         esac
@@ -85,8 +86,15 @@ defmodule RedisServerWrapperUnitTest do
 
     assert {:ok, args} = Cli.run(cli, ["ECHO"])
     assert args =~ "-h ready -p 6380"
-    assert args =~ "-a secret --no-auth-warning"
     assert args =~ "--tls ECHO"
+    refute args =~ "secret"
+    refute args =~ " -a "
+
+    assert {:ok, auth} = Cli.run(cli, ["SHOW_AUTH"])
+    assert auth =~ "auth=secret"
+    assert auth =~ "args=-h ready -p 6380 --tls SHOW_AUTH"
+    refute auth =~ " -a "
+
     assert Cli.run!(cli, ["ECHO"]) =~ "--tls ECHO"
     assert Cli.ping(cli)
 
@@ -129,6 +137,41 @@ defmodule RedisServerWrapperUnitTest do
 
     assert {:error, "sentinel-error"} =
              Cli.sentinel_master(Cli.new(bin: bin, host: "error"), "mymaster")
+  end
+
+  test "private file helpers create, replace, and harden filesystem state", %{
+    fixture_dir: fixture_dir
+  } do
+    private_dir = Path.join(fixture_dir, "private")
+    private_file = Path.join(private_dir, "secret")
+    missing_file = Path.join(private_dir, "missing")
+
+    SecureFile.make_private_directory!(private_dir)
+    assert file_mode(private_dir) == 0o700
+
+    SecureFile.write_private!(private_file, "first")
+    assert File.read!(private_file) == "first"
+    assert file_mode(private_file) == 0o600
+
+    File.chmod!(private_file, 0o644)
+    SecureFile.write_private!(private_file, "second")
+    assert File.read!(private_file) == "second"
+    assert file_mode(private_file) == 0o600
+
+    SecureFile.atomic_write_private!(private_file, "atomic")
+    assert File.read!(private_file) == "atomic"
+    assert file_mode(private_file) == 0o600
+    assert Path.wildcard(Path.join(private_dir, ".*.tmp-*")) == []
+
+    File.chmod!(private_file, 0o644)
+    assert :ok = SecureFile.harden_private_file(private_file)
+    assert file_mode(private_file) == 0o600
+    assert :missing = SecureFile.harden_private_file(missing_file)
+
+    assert {:error, {:not_a_regular_file, :directory}} =
+             SecureFile.harden_private_file(private_dir)
+
+    assert_raise ArgumentError, fn -> SecureFile.write_private!(private_dir, "nope") end
   end
 
   test "top-level availability and version helpers cover every result shape", context do
@@ -309,6 +352,8 @@ defmodule RedisServerWrapperUnitTest do
     File.chmod!(path, 0o755)
     path
   end
+
+  defp file_mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
 
   defp restore_path(nil), do: System.delete_env("PATH")
   defp restore_path(path), do: System.put_env("PATH", path)

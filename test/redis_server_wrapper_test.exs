@@ -170,6 +170,10 @@ defmodule RedisServerWrapperTest do
       assert {:ok, "OK"} = Server.run(server, ["SET", "k", "v"])
       assert {:ok, "v"} = Server.run(server, ["GET", "k"])
 
+      node_dir = Server.info(server).node_dir
+      assert file_mode(node_dir) == 0o700
+      assert file_mode(Path.join(node_dir, "redis.conf")) == 0o600
+
       Server.stop(server)
       Process.sleep(500)
     end
@@ -378,7 +382,7 @@ defmodule RedisServerWrapperTest do
       Application.put_env(:redis_server_wrapper, :manager_state_file, state_file)
 
       on_exit(fn ->
-        Enum.each([6430, 6470, 6471, 7430, 7431, 7432, 26_470], fn port ->
+        Enum.each([6430, 6470, 6471, 6488, 6489, 7430, 7431, 7432, 26_470], fn port ->
           Cli.shutdown(Cli.new(port: port))
         end)
 
@@ -415,6 +419,120 @@ defmodule RedisServerWrapperTest do
 
       assert :ok = Manager.stop(instance.name)
       assert wait_until(fn -> not Cli.ping(cli) end, 5, 200)
+    end
+
+    test "credentials stay out of default output and state is private", %{state_file: state_file} do
+      password = "a:b@/?#%"
+      parent = self()
+
+      output =
+        ExUnit.CaptureIO.capture_io(fn ->
+          send(
+            parent,
+            {:started,
+             Manager.start_basic(
+               name: "redacted-basic",
+               port: 6488,
+               password: password
+             )}
+          )
+        end)
+
+      assert_receive {:started, {:ok, instance}}
+
+      try do
+        refute output =~ password
+        assert output =~ "[REDACTED]"
+        assert file_mode(Path.dirname(state_file)) == 0o700
+        assert file_mode(state_file) == 0o600
+
+        assert {:ok, credentials} = Manager.credentials(instance.name)
+        assert credentials.password == password
+
+        assert credentials.url ==
+                 "redis://:a%3Ab%40%2F%3F%23%25@127.0.0.1:6488"
+
+        info_output =
+          ExUnit.CaptureIO.capture_io(fn ->
+            assert {:ok, %{name: "redacted-basic"}} = Manager.info(instance.name)
+          end)
+
+        refute info_output =~ password
+        assert info_output =~ "[REDACTED]"
+      after
+        Manager.stop(instance.name)
+      end
+    end
+
+    test "credentials encode IPv6 hosts and URL-significant passwords", %{state_file: state_file} do
+      password = "space and:@/%?#"
+
+      write_manager_state(state_file, %{
+        "ipv6-basic" =>
+          manager_instance("ipv6-basic", "basic", "2026-01-01T00:00:00Z")
+          |> Map.put("bind", "::1")
+          |> Map.put("ports", [6379])
+          |> Map.put("password", password)
+      })
+
+      assert {:ok, %{password: ^password, url: url}} = Manager.credentials("ipv6-basic")
+      assert url == "redis://:space%20and%3A%40%2F%25%3F%23@[::1]:6379"
+    end
+
+    test "invalid state is preserved and does not crash Manager", %{state_file: state_file} do
+      File.mkdir_p!(Path.dirname(state_file))
+      File.write!(state_file, ~s({"instances":))
+      File.chmod!(state_file, 0o644)
+
+      assert Manager.list() == []
+      refute File.exists?(state_file)
+
+      assert [backup] = Path.wildcard("#{state_file}.corrupt-*")
+      assert File.read!(backup) == ~s({"instances":)
+      assert file_mode(backup) == 0o600
+    end
+
+    test "unknown metadata keys never create atoms", %{state_file: state_file} do
+      unknown_key = "manager_unknown_#{System.unique_integer([:positive])}"
+
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+
+      write_manager_state(state_file, %{
+        "metadata-basic" =>
+          manager_instance("metadata-basic", "basic", "2026-01-01T00:00:00Z")
+          |> Map.put("metadata", %{unknown_key => "retained"})
+      })
+
+      assert {:ok, info} = Manager.info("metadata-basic")
+      assert info.metadata[unknown_key] == "retained"
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+    end
+
+    @tag timeout: 30_000
+    test "concurrent Manager mutations retain every instance and valid JSON", %{
+      state_file: state_file
+    } do
+      tasks =
+        [
+          {"concurrent-a", 6488},
+          {"concurrent-b", 6489}
+        ]
+        |> Enum.map(fn {name, port} ->
+          Task.async(fn -> Manager.start_basic(name: name, port: port, password: nil) end)
+        end)
+
+      assert Enum.all?(Task.await_many(tasks, 20_000), &match?({:ok, _instance}, &1))
+
+      assert Manager.list()
+             |> Enum.map(& &1.name)
+             |> Enum.sort() == ["concurrent-a", "concurrent-b"]
+
+      assert {:ok, %{"instances" => instances}} =
+               state_file |> File.read!() |> JSON.decode()
+
+      assert Map.keys(instances) |> Enum.sort() == ["concurrent-a", "concurrent-b"]
+      assert file_mode(state_file) == 0o600
+      assert :ok = Manager.stop_all()
     end
 
     test "persisted state supports listing, filtering, details, and missing names", %{
@@ -746,6 +864,12 @@ defmodule RedisServerWrapperTest do
         assert wait_until(fn -> Sentinel.healthy?(sentinel) end)
         assert Sentinel.info(sentinel).replicas == 0
         assert Sentinel.sentinel_addrs(sentinel) == ["127.0.0.1:26510"]
+
+        sentinel_dir = :sys.get_state(sentinel).sentinel_dir
+        sentinel_conf = Path.join([sentinel_dir, "sentinel-26510", "sentinel.conf"])
+        assert file_mode(sentinel_dir) == 0o700
+        assert file_mode(Path.dirname(sentinel_conf)) == 0o700
+        assert file_mode(sentinel_conf) == 0o600
       after
         if Process.alive?(sentinel), do: Sentinel.stop(sentinel)
       end
@@ -789,6 +913,8 @@ defmodule RedisServerWrapperTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, JSON.encode!(state))
   end
+
+  defp file_mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
 
   defp manager_instance(name, type, created_at) do
     %{

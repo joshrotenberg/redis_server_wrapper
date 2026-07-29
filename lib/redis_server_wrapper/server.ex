@@ -38,7 +38,7 @@ defmodule RedisServerWrapper.Server do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, OSProcess}
+  alias RedisServerWrapper.{Cli, Config, OSProcess, SecureFile}
 
   require Logger
 
@@ -352,7 +352,7 @@ defmodule RedisServerWrapper.Server do
     }
 
     conf_path = Path.join(node_dir, "redis.conf")
-    File.write!(conf_path, Config.to_config_string(config))
+    SecureFile.write_private!(conf_path, Config.to_config_string(config))
 
     server_bin_path = System.find_executable(redis_server_bin)
 
@@ -432,7 +432,7 @@ defmodule RedisServerWrapper.Server do
     }
 
     conf_path = Path.join(node_dir, "redis.conf")
-    File.write!(conf_path, Config.to_config_string(config))
+    SecureFile.write_private!(conf_path, Config.to_config_string(config))
 
     server_bin_path = System.find_executable(redis_server_bin)
 
@@ -512,7 +512,7 @@ defmodule RedisServerWrapper.Server do
     }
 
     conf_path = Path.join(node_dir, "redis.conf")
-    File.write!(conf_path, Config.to_config_string(config))
+    SecureFile.write_private!(conf_path, Config.to_config_string(config))
 
     server_bin_path = System.find_executable(redis_server_bin) || redis_server_bin
 
@@ -598,7 +598,7 @@ defmodule RedisServerWrapper.Server do
       ])
 
     File.rm_rf!(dir)
-    File.mkdir_p!(dir)
+    SecureFile.make_private_directory!(dir)
     dir
   end
 
