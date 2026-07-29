@@ -26,6 +26,8 @@ defmodule RedisServerWrapper.Sentinel do
     * `:down_after_ms` - down-after-milliseconds (default: 5000)
     * `:failover_timeout_ms` - failover timeout (default: 10_000)
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:control_host` - address used by redis-cli, replication, and Sentinel
+      monitoring (default: first bind address)
     * `:password` - Redis password
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
@@ -41,7 +43,7 @@ defmodule RedisServerWrapper.Sentinel do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, OSProcess, SecureFile, Server}
+  alias RedisServerWrapper.{Cli, Config, OSProcess, SecureFile, Server}
 
   require Logger
 
@@ -49,6 +51,7 @@ defmodule RedisServerWrapper.Sentinel do
     :master_name,
     :master_port,
     :bind,
+    :control_host,
     :password,
     :redis_cli_bin,
     :master_pid,
@@ -130,6 +133,11 @@ defmodule RedisServerWrapper.Sentinel do
     down_after_ms = Keyword.get(opts, :down_after_ms, 5000)
     failover_timeout_ms = Keyword.get(opts, :failover_timeout_ms, 10_000)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+
+    control_host =
+      Config.new(bind: bind, control_host: Keyword.get(opts, :control_host))
+      |> Config.control_host()
+
     password = Keyword.get(opts, :password)
 
     redis_server_bin =
@@ -142,6 +150,7 @@ defmodule RedisServerWrapper.Sentinel do
 
     node_opts = %{
       bind: bind,
+      control_host: control_host,
       password: password,
       redis_server_bin: redis_server_bin,
       redis_cli_bin: redis_cli_bin,
@@ -175,6 +184,7 @@ defmodule RedisServerWrapper.Sentinel do
              master_name: master_name,
              master_port: master_port,
              bind: bind,
+             control_host: control_host,
              password: password,
              quorum: quorum,
              down_after_ms: down_after_ms,
@@ -192,6 +202,7 @@ defmodule RedisServerWrapper.Sentinel do
         master_name: master_name,
         master_port: master_port,
         bind: bind,
+        control_host: control_host,
         password: password,
         redis_cli_bin: redis_cli_bin,
         master_pid: master_pid,
@@ -212,21 +223,23 @@ defmodule RedisServerWrapper.Sentinel do
 
   @impl true
   def handle_call(:master_addr, _from, state) do
-    {:reply, "#{state.bind}:#{state.master_port}", state}
+    {:reply, format_addr(state.control_host, state.master_port), state}
   end
 
   def handle_call(:sentinel_addrs, _from, state) do
-    addrs = Enum.map(state.sentinel_ports, &"#{state.bind}:#{&1}")
+    addrs = Enum.map(state.sentinel_ports, &format_addr(state.control_host, &1))
     {:reply, addrs, state}
   end
 
   def handle_call(:info, _from, state) do
     info = %{
       master_name: state.master_name,
-      master_addr: "#{state.bind}:#{state.master_port}",
+      bind: state.bind,
+      control_host: state.control_host,
+      master_addr: format_addr(state.control_host, state.master_port),
       replicas: state.num_replicas,
       sentinels: state.num_sentinels,
-      sentinel_addrs: Enum.map(state.sentinel_ports, &"#{state.bind}:#{&1}")
+      sentinel_addrs: Enum.map(state.sentinel_ports, &format_addr(state.control_host, &1))
     }
 
     {:reply, info, state}
@@ -235,7 +248,7 @@ defmodule RedisServerWrapper.Sentinel do
   def handle_call(:healthy?, _from, state) do
     result =
       Enum.any?(state.sentinel_ports, fn port ->
-        cli = Cli.new(bin: state.redis_cli_bin, host: state.bind, port: port)
+        cli = Cli.new(bin: state.redis_cli_bin, host: state.control_host, port: port)
 
         case Cli.sentinel_master(cli, state.master_name) do
           {:ok, info} ->
@@ -258,7 +271,7 @@ defmodule RedisServerWrapper.Sentinel do
   def handle_call(:poke, _from, state) do
     result =
       Enum.find_value(state.sentinel_ports, {:error, :no_reachable_sentinel}, fn port ->
-        cli = Cli.new(bin: state.redis_cli_bin, host: state.bind, port: port)
+        cli = Cli.new(bin: state.redis_cli_bin, host: state.control_host, port: port)
 
         case Cli.sentinel_master(cli, state.master_name) do
           {:ok, info} -> {:ok, info}
@@ -324,6 +337,7 @@ defmodule RedisServerWrapper.Sentinel do
     Server.start_link(
       port: port,
       bind: node_opts.bind,
+      control_host: node_opts.control_host,
       password: node_opts.password,
       redis_server_bin: node_opts.redis_server_bin,
       redis_cli_bin: node_opts.redis_cli_bin,
@@ -344,9 +358,10 @@ defmodule RedisServerWrapper.Sentinel do
         opts = [
           port: port,
           bind: node_opts.bind,
+          control_host: node_opts.control_host,
           password: node_opts.password,
           masterauth: node_opts.password,
-          replicaof: {node_opts.bind, master_port},
+          replicaof: {node_opts.control_host, master_port},
           redis_server_bin: node_opts.redis_server_bin,
           redis_cli_bin: node_opts.redis_cli_bin,
           timeout: node_opts.timeout,
@@ -413,7 +428,7 @@ defmodule RedisServerWrapper.Sentinel do
       conf_path,
       node_dir,
       opts.redis_cli_bin,
-      opts.bind,
+      opts.control_host,
       port,
       opts.timeout
     )
@@ -422,6 +437,7 @@ defmodule RedisServerWrapper.Sentinel do
   defp generate_sentinel_conf(opts, dir, port) do
     %{
       bind: bind,
+      control_host: control_host,
       master_name: master_name,
       master_port: master_port,
       password: password,
@@ -430,22 +446,24 @@ defmodule RedisServerWrapper.Sentinel do
       failover_timeout_ms: failover_timeout_ms
     } = opts
 
+    listen_addresses = Config.new(bind: bind) |> Config.listen_addresses()
+
     lines = [
-      "port #{port}",
-      "bind #{bind}",
-      "daemonize yes",
-      "pidfile #{Path.join(dir, "sentinel.pid")}",
-      "logfile #{Path.join(dir, "sentinel.log")}",
-      "dir #{dir}",
-      "sentinel monitor #{master_name} #{bind} #{master_port} #{quorum}",
-      "sentinel down-after-milliseconds #{master_name} #{down_after_ms}",
-      "sentinel failover-timeout #{master_name} #{failover_timeout_ms}",
-      "sentinel parallel-syncs #{master_name} 1"
+      Config.directive("port", [port]),
+      Config.directive("bind", listen_addresses),
+      Config.directive("daemonize", ["yes"]),
+      Config.directive("pidfile", [Path.join(dir, "sentinel.pid")]),
+      Config.directive("logfile", [Path.join(dir, "sentinel.log")]),
+      Config.directive("dir", [dir]),
+      Config.directive("sentinel", ["monitor", master_name, control_host, master_port, quorum]),
+      Config.directive("sentinel", ["down-after-milliseconds", master_name, down_after_ms]),
+      Config.directive("sentinel", ["failover-timeout", master_name, failover_timeout_ms]),
+      Config.directive("sentinel", ["parallel-syncs", master_name, 1])
     ]
 
     lines =
       if password do
-        lines ++ ["sentinel auth-pass #{master_name} #{password}"]
+        lines ++ [Config.directive("sentinel", ["auth-pass", master_name, password])]
       else
         lines
       end
@@ -569,6 +587,14 @@ defmodule RedisServerWrapper.Sentinel do
 
   defp ports_from(_base_port, 0), do: []
   defp ports_from(base_port, count), do: Enum.map(0..(count - 1), &(base_port + &1))
+
+  defp format_addr(host, port) do
+    if String.contains?(host, ":") do
+      "[#{host}]:#{port}"
+    else
+      "#{host}:#{port}"
+    end
+  end
 
   defp detach_servers(servers) do
     Enum.reduce_while(servers, :ok, fn server, :ok ->

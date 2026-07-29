@@ -83,10 +83,67 @@ defmodule RedisServerWrapperTest do
     end
 
     test "extra directives" do
-      config = Config.new(extra: [{"maxmemory-policy", "allkeys-lru"}, {"hz", "20"}])
+      config =
+        Config.new(
+          extra: [
+            {"notify-keyspace-events", "KEA"},
+            {"client-output-buffer-limit", ["pubsub", "32mb", "8mb", "60"]},
+            {"hz", "20"}
+          ]
+        )
+
       output = Config.to_config_string(config)
-      assert output =~ "maxmemory-policy allkeys-lru"
+      assert output =~ "notify-keyspace-events KEA"
+      assert output =~ "client-output-buffer-limit pubsub 32mb 8mb 60"
       assert output =~ "hz 20"
+    end
+
+    test "quotes and escapes every directive token safely" do
+      config =
+        Config.new(
+          password: "space \"quote\" \\ slash\nnext#",
+          logfile: "/tmp/redis logs/quoted\"name.log",
+          replicaof: {"replica host", 6379},
+          extra: [{"acl-pubsub-default", "resetchannels\nallchannels"}]
+        )
+
+      output = Config.to_config_string(config)
+
+      assert output =~ ~s(requirepass "space \\"quote\\" \\\\ slash\\nnext#")
+      assert output =~ ~s(logfile "/tmp/redis logs/quoted\\"name.log")
+      assert output =~ ~s(replicaof "replica host" 6379)
+      assert output =~ ~s(acl-pubsub-default "resetchannels\\nallchannels")
+      refute output =~ "slash\nnext"
+    end
+
+    test "supports multiple bind addresses with a separate control host" do
+      config = Config.new(bind: ["127.0.0.1", "::1"], control_host: "::1")
+
+      assert Config.to_config_string(config) =~ "bind 127.0.0.1 ::1"
+      assert Config.listen_addresses(config) == ["127.0.0.1", "::1"]
+      assert Config.control_host(config) == "::1"
+    end
+
+    test "rejects reserved extras and invalid typed values" do
+      assert_raise ArgumentError, ~r/cannot override.*port/, fn ->
+        Config.new(extra: [{"port", "9999"}])
+      end
+
+      assert_raise ArgumentError, ~r/cannot override.*daemonize/, fn ->
+        Config.new(extra: [{"daemonize", ["yes"]}])
+      end
+
+      assert_raise ArgumentError, ~r/:port must be/, fn -> Config.new(port: 70_000) end
+      assert_raise ArgumentError, ~r/:loglevel must be/, fn -> Config.new(loglevel: :loud) end
+      assert_raise ArgumentError, ~r/:appendonly must be/, fn -> Config.new(appendonly: "yes") end
+
+      assert_raise ArgumentError, ~r/:save entries must be/, fn ->
+        Config.new(save: [{0, 1}])
+      end
+
+      assert_raise ArgumentError, ~r/argument_vector/, fn ->
+        Config.new(extra: [{"hz", ["10", :unsafe]}])
+      end
     end
 
     test "module paths and structured module arguments" do
@@ -100,10 +157,10 @@ defmodule RedisServerWrapperTest do
 
       output = Config.to_config_string(config)
 
-      assert output =~ "loadmodule /modules/legacy.so events expired"
+      assert output =~ ~s(loadmodule "/modules/legacy.so events expired")
 
       assert output =~
-               ~s(loadmodule "/modules/event stream.so" "events" "expired,set" "maxlen" "10000")
+               ~s(loadmodule "/modules/event stream.so" events expired,set maxlen 10000)
     end
 
     test "rejects invalid module specifications" do
@@ -164,7 +221,8 @@ defmodule RedisServerWrapperTest do
     end
 
     test "start with password" do
-      {:ok, server} = Server.start_link(port: 6401, password: "testsecret")
+      password = "test secret\"\\\n#"
+      {:ok, server} = Server.start_link(port: 6401, password: password)
 
       assert Server.ping(server)
       assert {:ok, "OK"} = Server.run(server, ["SET", "k", "v"])
@@ -176,6 +234,24 @@ defmodule RedisServerWrapperTest do
 
       Server.stop(server)
       Process.sleep(500)
+    end
+
+    test "multiple listen addresses use an explicit control host" do
+      {:ok, server} =
+        Server.start_link(
+          port: 6405,
+          bind: ["127.0.0.1", "::1"],
+          control_host: "127.0.0.1"
+        )
+
+      try do
+        assert Server.ping(server)
+        assert Server.info(server).bind == ["127.0.0.1", "::1"]
+        assert Server.info(server).host == "127.0.0.1"
+        assert Server.cli(server).host == "127.0.0.1"
+      after
+        Server.stop(server)
+      end
     end
 
     test "detach prevents shutdown on stop (unmanaged)" do
@@ -794,10 +870,18 @@ defmodule RedisServerWrapperTest do
 
     @tag timeout: 30_000
     test "start 3-master cluster, verify health, stop" do
-      {:ok, cluster} = RedisServerWrapper.start_cluster(masters: 3, base_port: 7100)
+      {:ok, cluster} =
+        RedisServerWrapper.start_cluster(
+          masters: 3,
+          base_port: 7100,
+          bind: ["127.0.0.1", "::1"],
+          control_host: "127.0.0.1"
+        )
 
       assert Cluster.all_alive?(cluster)
       assert wait_until(fn -> Cluster.healthy?(cluster) end)
+      assert Cluster.addr(cluster) == "127.0.0.1:7100"
+      assert Cluster.info(cluster).bind == ["127.0.0.1", "::1"]
 
       info = Cluster.info(cluster)
       assert info.masters == 3
@@ -857,7 +941,10 @@ defmodule RedisServerWrapperTest do
           replicas: 0,
           sentinels: 1,
           sentinel_base_port: 26_510,
-          quorum: 1
+          quorum: 1,
+          bind: ["127.0.0.1", "::1"],
+          control_host: "127.0.0.1",
+          password: "sentinel secret\"\\\n#"
         )
 
       try do

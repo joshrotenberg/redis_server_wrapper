@@ -197,9 +197,11 @@ EVENT_STREAM_MODULE=/absolute/path/to/libredis_event_stream_module.so \
 
 ## Configuration
 
-All Redis configuration directives can be set via the `Config` struct options.
-Use the `:extra` option as an escape hatch for any directive not covered by
-the typed fields:
+All Redis configuration values are encoded as individual Redis tokens, including
+paths, passwords, module arguments, and `:extra` directives. Use a string for a
+single extra argument or a list for a multi-argument directive. Extras cannot
+override wrapper-owned lifecycle or transport settings such as `port`, `bind`,
+`daemonize`, `pidfile`, or `dir`.
 
 ```elixir
 RedisServerWrapper.start_server(
@@ -209,8 +211,21 @@ RedisServerWrapper.start_server(
   maxmemory_policy: "allkeys-lru",
   extra: [
     {"notify-keyspace-events", "KEA"},
+    {"client-output-buffer-limit", ["pubsub", "32mb", "8mb", "60"]},
     {"hz", "100"}
   ]
+)
+```
+
+`bind` may be one address, a whitespace-separated string, or a list of listen
+addresses. `control_host` independently selects the address used by
+`redis-cli`, readiness probes, replication, Cluster, and Sentinel:
+
+```elixir
+RedisServerWrapper.start_server(
+  port: 6400,
+  bind: ["127.0.0.1", "::1"],
+  control_host: "127.0.0.1"
 )
 ```
 

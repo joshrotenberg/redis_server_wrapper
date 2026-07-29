@@ -211,7 +211,8 @@ defmodule RedisServerWrapper.Server do
 
   def handle_call(:info, _from, state) do
     info = %{
-      host: state.config.bind,
+      host: Config.control_host(state.config),
+      bind: state.config.bind,
       port: state.config.port,
       password: state.config.password,
       pid: state.pid,
@@ -335,7 +336,7 @@ defmodule RedisServerWrapper.Server do
 
   # Port-based: redis-server runs in the foreground, tied to the BEAM.
   defp start_managed(config, redis_server_bin, redis_cli_bin, timeout) do
-    with :ok <- check_port_available(config.bind, config.port) do
+    with :ok <- check_port_available(Config.control_host(config), config.port) do
       do_start_managed(config, redis_server_bin, redis_cli_bin, timeout)
     end
   end
@@ -370,7 +371,7 @@ defmodule RedisServerWrapper.Server do
     cli =
       Cli.new(
         bin: redis_cli_bin,
-        host: config.bind,
+        host: Config.control_host(config),
         port: config.port,
         password: config.password
       )
@@ -412,7 +413,7 @@ defmodule RedisServerWrapper.Server do
   # where terminate/2 never runs.
   defp start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout) do
     if forcola_available?() do
-      with :ok <- check_port_available(config.bind, config.port) do
+      with :ok <- check_port_available(Config.control_host(config), config.port) do
         do_start_managed_forcola(config, redis_server_bin, redis_cli_bin, timeout)
       end
     else
@@ -442,7 +443,7 @@ defmodule RedisServerWrapper.Server do
     cli =
       Cli.new(
         bin: redis_cli_bin,
-        host: config.bind,
+        host: Config.control_host(config),
         port: config.port,
         password: config.password
       )
@@ -494,7 +495,7 @@ defmodule RedisServerWrapper.Server do
   # wanted instances. If the port is held, check_port_available returns
   # {:error, {:port_in_use, ...}} and the caller decides what to do.
   defp start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout) do
-    with :ok <- check_port_available(config.bind, config.port) do
+    with :ok <- check_port_available(Config.control_host(config), config.port) do
       do_start_unmanaged(config, redis_server_bin, redis_cli_bin, timeout)
     end
   end
@@ -524,7 +525,7 @@ defmodule RedisServerWrapper.Server do
         cli =
           Cli.new(
             bin: redis_cli_bin,
-            host: config.bind,
+            host: Config.control_host(config),
             port: config.port,
             password: config.password
           )

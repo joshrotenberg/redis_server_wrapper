@@ -5,7 +5,8 @@ defmodule RedisServerWrapper.Config do
   Redis server configuration builder.
 
   Generates redis.conf content from a structured configuration.
-  Supports all common Redis directives with an escape hatch via `:extra` for anything else.
+  Supports common Redis directives plus token-safe `:extra` directives for
+  anything else. Every value is encoded as a Redis configuration token.
   """
 
   @type log_level :: :debug | :verbose | :notice | :warning
@@ -14,15 +15,23 @@ defmodule RedisServerWrapper.Config do
   @typedoc """
   A Redis module path, optionally paired with an argument vector.
 
-  Plain strings preserve the original raw `loadmodule` directive behavior.
-  Prefer `{path, args}` when arguments are needed so paths and arguments are
-  quoted safely in the generated config.
+  A plain string is one module-path token. Use `{path, args}` when arguments
+  are needed; paths and arguments are always quoted safely when required.
   """
   @type module_spec :: String.t() | {String.t(), [String.t()]}
+  @type bind_addresses :: String.t() | [String.t()]
+  @type extra_spec :: {String.t(), String.t() | [String.t()]}
+
+  # These validators intentionally defend the runtime struct boundary against
+  # values outside the public typespec.
+  @dialyzer {:nowarn_function, validate_save!: 1}
+  @dialyzer {:nowarn_function, validate_modules!: 1}
+  @dialyzer {:nowarn_function, validate_extra!: 1}
 
   @type t :: %__MODULE__{
           port: non_neg_integer(),
-          bind: String.t(),
+          bind: bind_addresses(),
+          control_host: String.t() | nil,
           password: String.t() | nil,
           loglevel: log_level(),
           logfile: String.t() | nil,
@@ -61,11 +70,12 @@ defmodule RedisServerWrapper.Config do
           # Modules
           loadmodule: [module_spec()],
           # Catch-all
-          extra: [{String.t(), String.t()}]
+          extra: [extra_spec()]
         }
 
   defstruct port: 6379,
             bind: "127.0.0.1",
+            control_host: nil,
             password: nil,
             loglevel: :notice,
             logfile: nil,
@@ -112,8 +122,40 @@ defmodule RedisServerWrapper.Config do
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     config = struct!(__MODULE__, opts)
-    validate_modules!(config.loadmodule)
+    validate!(config)
     config
+  end
+
+  @doc """
+  Returns the address used by `redis-cli` and lifecycle probes.
+
+  `:bind` controls Redis listen addresses. Set `:control_host` when Redis
+  listens on multiple addresses or on a wildcard address.
+  """
+  @spec control_host(t()) :: String.t()
+  def control_host(%__MODULE__{control_host: host}) when is_binary(host), do: host
+
+  def control_host(%__MODULE__{bind: bind}) do
+    bind
+    |> bind_tokens()
+    |> List.first()
+    |> normalize_control_host()
+  end
+
+  @doc "Returns normalized Redis listen-address tokens."
+  @spec listen_addresses(t()) :: [String.t()]
+  def listen_addresses(%__MODULE__{bind: bind}), do: bind_tokens(bind)
+
+  @doc """
+  Encodes one Redis configuration directive from an argument vector.
+
+  This is also used by the Sentinel configuration generator so it follows the
+  same quoting and escaping rules as `redis.conf`.
+  """
+  @spec directive(String.t(), [term()]) :: String.t()
+  def directive(key, values) when is_binary(key) and is_list(values) do
+    validate_directive_key!(key)
+    Enum.join([key | Enum.map(values, &encode_token/1)], " ")
   end
 
   @doc """
@@ -123,7 +165,7 @@ defmodule RedisServerWrapper.Config do
   def to_config_string(%__MODULE__{} = config) do
     []
     |> emit("port", config.port)
-    |> emit("bind", config.bind)
+    |> emit("bind", bind_tokens(config.bind))
     |> emit_if("requirepass", config.password)
     |> emit("loglevel", config.loglevel)
     |> emit_if("logfile", config.logfile)
@@ -152,17 +194,21 @@ defmodule RedisServerWrapper.Config do
 
   # Directive emitters
 
-  defp emit(acc, key, value), do: ["#{key} #{value}" | acc]
+  defp emit(acc, key, values) when is_list(values) do
+    [directive(key, values) | acc]
+  end
+
+  defp emit(acc, key, value), do: emit(acc, key, [value])
 
   defp emit_if(acc, _key, nil), do: acc
   defp emit_if(acc, key, value), do: emit(acc, key, value)
 
   defp emit_save(acc, :default), do: acc
-  defp emit_save(acc, :disabled), do: ["save \"\"" | acc]
+  defp emit_save(acc, :disabled), do: emit(acc, "save", [""])
 
   defp emit_save(acc, policies) when is_list(policies) do
     Enum.reduce(policies, acc, fn {seconds, changes}, acc ->
-      ["save #{seconds} #{changes}" | acc]
+      emit(acc, "save", [seconds, changes])
     end)
   end
 
@@ -183,7 +229,7 @@ defmodule RedisServerWrapper.Config do
     {host, port} = config.replicaof
 
     acc
-    |> emit("replicaof", "#{host} #{port}")
+    |> emit("replicaof", [host, port])
     |> emit_if("masterauth", config.masterauth)
   end
 
@@ -205,23 +251,183 @@ defmodule RedisServerWrapper.Config do
     Enum.reduce(modules, acc, &emit_module/2)
   end
 
-  # Preserve the original raw-string form for backwards compatibility. This
-  # allows existing callers that put both the path and arguments in one string
-  # to keep working unchanged.
-  defp emit_module(module, acc) when is_binary(module), do: ["loadmodule #{module}" | acc]
-
-  defp emit_module({path, args}, acc) do
-    directive =
-      [path | args]
-      |> Enum.map_join(" ", &quote_module_token/1)
-
-    ["loadmodule #{directive}" | acc]
-  end
+  defp emit_module(module, acc) when is_binary(module), do: emit(acc, "loadmodule", [module])
+  defp emit_module({path, args}, acc), do: emit(acc, "loadmodule", [path | args])
 
   defp emit_extra(acc, []), do: acc
 
   defp emit_extra(acc, extras) do
-    Enum.reduce(extras, acc, fn {key, value}, acc -> ["#{key} #{value}" | acc] end)
+    Enum.reduce(extras, acc, fn
+      {key, values}, acc when is_list(values) -> emit(acc, key, values)
+      {key, value}, acc -> emit(acc, key, [value])
+    end)
+  end
+
+  @reserved_directives MapSet.new(~w(
+    port bind requirepass loglevel logfile daemonize pidfile dir save
+    appendonly appendfsync maxmemory maxmemory-policy tcp-backlog timeout
+    tcp-keepalive unixsocket unixsocketperm tls-port tls-cert-file
+    tls-key-file tls-ca-cert-file tls-auth-clients replicaof masterauth
+    cluster-enabled cluster-config-file cluster-node-timeout
+    cluster-announce-hostname cluster-announce-port cluster-announce-bus-port
+    loadmodule
+  ))
+
+  defp validate!(config) do
+    validate_enum!(:loglevel, config.loglevel, [:debug, :verbose, :notice, :warning])
+    validate_enum!(:appendfsync, config.appendfsync, [:always, :everysec, :no])
+    validate_boolean!(:daemonize, config.daemonize)
+    validate_boolean!(:appendonly, config.appendonly)
+    validate_boolean!(:cluster_enabled, config.cluster_enabled)
+    validate_port!(:port, config.port)
+
+    Enum.each(
+      [
+        tcp_backlog: config.tcp_backlog,
+        timeout: config.timeout,
+        tcp_keepalive: config.tcp_keepalive,
+        cluster_node_timeout: config.cluster_node_timeout
+      ],
+      fn {field, value} -> validate_optional_non_negative_integer!(field, value) end
+    )
+
+    Enum.each(
+      [
+        tls_port: config.tls_port,
+        cluster_announce_port: config.cluster_announce_port,
+        cluster_announce_bus_port: config.cluster_announce_bus_port
+      ],
+      fn {field, value} -> validate_optional_port!(field, value) end
+    )
+
+    validate_bind!(config.bind)
+    validate_control_host!(config)
+
+    Enum.each(
+      [
+        password: config.password,
+        logfile: config.logfile,
+        pidfile: config.pidfile,
+        dir: config.dir,
+        maxmemory: config.maxmemory,
+        maxmemory_policy: config.maxmemory_policy,
+        unixsocket: config.unixsocket,
+        unixsocketperm: config.unixsocketperm,
+        tls_cert_file: config.tls_cert_file,
+        tls_key_file: config.tls_key_file,
+        tls_ca_cert_file: config.tls_ca_cert_file,
+        tls_auth_clients: config.tls_auth_clients,
+        masterauth: config.masterauth,
+        cluster_config_file: config.cluster_config_file,
+        cluster_announce_hostname: config.cluster_announce_hostname
+      ],
+      fn {field, value} -> validate_optional_binary!(field, value) end
+    )
+
+    validate_save!(config.save)
+    validate_replicaof!(config.replicaof)
+    validate_modules!(config.loadmodule)
+    validate_extra!(config.extra)
+  end
+
+  defp validate_enum!(field, value, allowed) do
+    unless value in allowed do
+      raise ArgumentError, ":#{field} must be one of #{inspect(allowed)}, got: #{inspect(value)}"
+    end
+  end
+
+  defp validate_boolean!(_field, value) when is_boolean(value), do: :ok
+
+  defp validate_boolean!(field, value) do
+    raise ArgumentError, ":#{field} must be a boolean, got: #{inspect(value)}"
+  end
+
+  defp validate_port!(_field, value) when is_integer(value) and value in 1..65_535, do: :ok
+
+  defp validate_port!(field, value) do
+    raise ArgumentError, ":#{field} must be an integer from 1 to 65535, got: #{inspect(value)}"
+  end
+
+  defp validate_optional_port!(_field, nil), do: :ok
+  defp validate_optional_port!(field, value), do: validate_port!(field, value)
+
+  defp validate_optional_non_negative_integer!(_field, nil), do: :ok
+
+  defp validate_optional_non_negative_integer!(_field, value)
+       when is_integer(value) and value >= 0,
+       do: :ok
+
+  defp validate_optional_non_negative_integer!(field, value) do
+    raise ArgumentError, ":#{field} must be a non-negative integer, got: #{inspect(value)}"
+  end
+
+  defp validate_optional_binary!(_field, nil), do: :ok
+  defp validate_optional_binary!(_field, value) when is_binary(value), do: :ok
+
+  defp validate_optional_binary!(field, value) do
+    raise ArgumentError, ":#{field} must be a string or nil, got: #{inspect(value)}"
+  end
+
+  defp validate_bind!(bind) do
+    bind
+    |> bind_tokens()
+    |> validate_bind_tokens!()
+  end
+
+  defp validate_bind_tokens!([]), do: raise(ArgumentError, ":bind must contain an address")
+  defp validate_bind_tokens!(addresses), do: Enum.each(addresses, &validate_bind_address!/1)
+
+  defp validate_bind_address!(address) when is_binary(address) and address != "", do: :ok
+
+  defp validate_bind_address!(_address) do
+    raise ArgumentError, ":bind addresses must be non-empty strings"
+  end
+
+  defp validate_control_host!(config) do
+    host = control_host(config)
+
+    cond do
+      not is_binary(host) or host == "" or Regex.match?(~r/\s/u, host) ->
+        raise ArgumentError, ":control_host must resolve to one non-empty address"
+
+      is_nil(config.control_host) and host in ["*", "::*", "0.0.0.0", "::"] ->
+        raise ArgumentError,
+              ":control_host is required when the first bind address is a wildcard"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_save!(:default), do: :ok
+  defp validate_save!(:disabled), do: :ok
+
+  defp validate_save!(policies) when is_list(policies) do
+    Enum.each(policies, fn
+      {seconds, changes}
+      when is_integer(seconds) and seconds > 0 and is_integer(changes) and changes > 0 ->
+        :ok
+
+      policy ->
+        raise ArgumentError,
+              ":save entries must be {positive_seconds, positive_changes}, got: " <>
+                inspect(policy)
+    end)
+  end
+
+  defp validate_save!(value) do
+    raise ArgumentError,
+          ":save must be :default, :disabled, or a policy list, got: #{inspect(value)}"
+  end
+
+  defp validate_replicaof!(nil), do: :ok
+
+  defp validate_replicaof!({host, port}) when is_binary(host) and host != "" do
+    validate_port!(:replicaof_port, port)
+  end
+
+  defp validate_replicaof!(value) do
+    raise ArgumentError, ":replicaof must be {host, port} or nil, got: #{inspect(value)}"
   end
 
   defp validate_modules!(modules) when is_list(modules) do
@@ -249,16 +455,77 @@ defmodule RedisServerWrapper.Config do
             inspect(value)
   end
 
-  defp quote_module_token(value) do
+  defp validate_extra!(extras) when is_list(extras) do
+    Enum.each(extras, fn
+      {key, value} when is_binary(value) ->
+        validate_extra_key!(key)
+
+      {key, values} when is_list(values) ->
+        validate_extra_key!(key)
+
+        unless values != [] and Enum.all?(values, &is_binary/1) do
+          invalid_extra_spec!({key, values})
+        end
+
+      extra ->
+        invalid_extra_spec!(extra)
+    end)
+  end
+
+  defp validate_extra!(value), do: invalid_extra_spec!(value)
+
+  defp validate_extra_key!(key) when is_binary(key) do
+    normalized = String.downcase(key)
+    validate_directive_key!(normalized)
+
+    if MapSet.member?(@reserved_directives, normalized) do
+      raise ArgumentError,
+            ":extra cannot override wrapper-owned directive #{inspect(normalized)}"
+    end
+  end
+
+  defp validate_extra_key!(key), do: invalid_extra_spec!({key, []})
+
+  defp invalid_extra_spec!(value) do
+    raise ArgumentError,
+          ":extra must be a list of {directive, value_or_argument_vector} tuples, got: " <>
+            inspect(value)
+  end
+
+  defp validate_directive_key!(key) do
+    unless Regex.match?(~r/\A[a-z][a-z0-9-]*\z/, String.downcase(key)) do
+      raise ArgumentError, "invalid Redis directive name: #{inspect(key)}"
+    end
+  end
+
+  defp encode_token(value) do
+    value = to_string(value)
+
+    if value != "" and Regex.match?(~r/\A[^\s"\\#]+\z/u, value) do
+      value
+    else
+      quote_token(value)
+    end
+  end
+
+  defp quote_token(value) do
     escaped =
       value
       |> String.replace("\\", "\\\\")
       |> String.replace("\"", "\\\"")
       |> String.replace("\n", "\\n")
       |> String.replace("\r", "\\r")
+      |> String.replace("\t", "\\t")
 
     ~s("#{escaped}")
   end
+
+  defp bind_tokens(bind) when is_binary(bind), do: String.split(bind)
+  defp bind_tokens(bind) when is_list(bind), do: bind
+  defp bind_tokens(_bind), do: []
+
+  defp normalize_control_host("-" <> host), do: host
+  defp normalize_control_host(host), do: host
 
   defp yn(true), do: "yes"
   defp yn(false), do: "no"

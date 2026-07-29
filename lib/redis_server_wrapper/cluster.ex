@@ -25,6 +25,8 @@ defmodule RedisServerWrapper.Cluster do
       because macOS AirPlay Receiver binds it by default, which causes
       confusing cluster-start failures on Mac.
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:control_host` - address used by redis-cli and cluster announcements
+      (default: first bind address)
     * `:password` - Redis password (default: nil)
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
@@ -40,7 +42,7 @@ defmodule RedisServerWrapper.Cluster do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Server}
+  alias RedisServerWrapper.{Cli, Config, Server}
 
   require Logger
 
@@ -49,6 +51,7 @@ defmodule RedisServerWrapper.Cluster do
     :replicas_per_master,
     :base_port,
     :bind,
+    :control_host,
     :password,
     :redis_cli_bin,
     node_pids: [],
@@ -119,6 +122,11 @@ defmodule RedisServerWrapper.Cluster do
     replicas = Keyword.get(opts, :replicas_per_master, 0)
     base_port = Keyword.get(opts, :base_port, 7100)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+
+    control_host =
+      Config.new(bind: bind, control_host: Keyword.get(opts, :control_host))
+      |> Config.control_host()
+
     password = Keyword.get(opts, :password)
 
     redis_server_bin =
@@ -136,6 +144,7 @@ defmodule RedisServerWrapper.Cluster do
       replicas_per_master: replicas,
       base_port: base_port,
       bind: bind,
+      control_host: control_host,
       password: password,
       redis_server_bin: redis_server_bin,
       redis_cli_bin: redis_cli_bin,
@@ -154,14 +163,14 @@ defmodule RedisServerWrapper.Cluster do
 
   @impl true
   def handle_call(:addr, _from, state) do
-    {:reply, "#{state.bind}:#{state.base_port}", state}
+    {:reply, format_addr(state.control_host, state.base_port), state}
   end
 
   def handle_call(:node_addrs, _from, state) do
     addrs =
       Enum.map(state.node_pids, fn pid ->
         info = Server.info(pid)
-        "#{info.host}:#{info.port}"
+        format_addr(info.host, info.port)
       end)
 
     {:reply, addrs, state}
@@ -198,11 +207,12 @@ defmodule RedisServerWrapper.Cluster do
       replicas_per_master: state.replicas_per_master,
       base_port: state.base_port,
       bind: state.bind,
+      control_host: state.control_host,
       total_nodes: length(state.node_pids),
       node_addrs:
         Enum.map(state.node_pids, fn pid ->
           node_info = Server.info(pid)
-          "#{node_info.host}:#{node_info.port}"
+          format_addr(node_info.host, node_info.port)
         end)
     }
 
@@ -257,6 +267,7 @@ defmodule RedisServerWrapper.Cluster do
     node_opts =
       Map.take(settings, [
         :bind,
+        :control_host,
         :password,
         :redis_server_bin,
         :redis_cli_bin,
@@ -279,12 +290,12 @@ defmodule RedisServerWrapper.Cluster do
     seed_cli =
       Cli.new(
         bin: settings.redis_cli_bin,
-        host: settings.bind,
+        host: settings.control_host,
         port: settings.base_port,
         password: settings.password
       )
 
-    node_addr_list = Enum.map(ports, &"#{settings.bind}:#{&1}")
+    node_addr_list = Enum.map(ports, &format_addr(settings.control_host, &1))
 
     case Cli.cluster_create(seed_cli, node_addr_list, settings.replicas_per_master) do
       {:ok, _output} ->
@@ -296,6 +307,7 @@ defmodule RedisServerWrapper.Cluster do
           replicas_per_master: settings.replicas_per_master,
           base_port: settings.base_port,
           bind: settings.bind,
+          control_host: settings.control_host,
           password: settings.password,
           redis_cli_bin: settings.redis_cli_bin,
           node_pids: node_pids
@@ -317,6 +329,7 @@ defmodule RedisServerWrapper.Cluster do
           [
             port: port,
             bind: node_opts.bind,
+            control_host: node_opts.control_host,
             password: node_opts.password,
             redis_server_bin: node_opts.redis_server_bin,
             redis_cli_bin: node_opts.redis_cli_bin,
@@ -346,7 +359,7 @@ defmodule RedisServerWrapper.Cluster do
   defp seed_cli(state) do
     Cli.new(
       bin: state.redis_cli_bin,
-      host: state.bind,
+      host: state.control_host,
       port: state.base_port,
       password: state.password
     )
@@ -354,6 +367,14 @@ defmodule RedisServerWrapper.Cluster do
 
   defp extra_to_opts([]), do: []
   defp extra_to_opts(extra), do: [extra: extra]
+
+  defp format_addr(host, port) do
+    if String.contains?(host, ":") do
+      "[#{host}]:#{port}"
+    else
+      "#{host}:#{port}"
+    end
+  end
 
   defp detach_servers(servers) do
     Enum.reduce_while(servers, :ok, fn server, :ok ->

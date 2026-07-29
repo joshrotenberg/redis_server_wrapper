@@ -54,6 +54,7 @@ defmodule RedisServerWrapper.Manager do
     * `:port` - Redis port (default: 6379)
     * `:password` - Redis password (auto-generated if omitted, pass `nil` for no auth)
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:control_host` - address used for client and lifecycle operations
     * `:persist` - enable persistence (default: false)
     * `:maxmemory` - memory limit (e.g., "256mb")
     * `:loadmodule` - modules to load; accepts paths or `{path, [args]}` tuples
@@ -70,6 +71,7 @@ defmodule RedisServerWrapper.Manager do
     password = resolve_password(opts)
     port = Keyword.get(opts, :port, 6379)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+    control_host = Keyword.get(opts, :control_host)
     persist = Keyword.get(opts, :persist, false)
     maxmemory = Keyword.get(opts, :maxmemory)
     loadmodule = Keyword.get(opts, :loadmodule, [])
@@ -82,6 +84,7 @@ defmodule RedisServerWrapper.Manager do
         [
           port: port,
           bind: bind,
+          control_host: control_host,
           password: password,
           save: if(persist, do: :default, else: :disabled),
           appendonly: persist,
@@ -101,11 +104,11 @@ defmodule RedisServerWrapper.Manager do
             name: name,
             type: :basic,
             created_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-            bind: bind,
+            bind: info.host,
             ports: [port],
             pids: [info.pid],
             password: password,
-            url: build_url(bind, port, password),
+            url: build_url(info.host, port, password),
             metadata: %{
               persist: persist,
               maxmemory: maxmemory,
@@ -134,6 +137,7 @@ defmodule RedisServerWrapper.Manager do
     * `:base_port` - starting port (default: 7100)
     * `:password` - Redis password (auto-generated if omitted)
     * `:bind` - bind address (default: "127.0.0.1")
+    * `:control_host` - address used for client and cluster operations
     * `:loadmodule` - modules loaded into every cluster node
   """
   @spec start_cluster(keyword()) :: {:ok, instance()} | {:error, term()}
@@ -149,6 +153,7 @@ defmodule RedisServerWrapper.Manager do
     replicas = Keyword.get(opts, :replicas_per_master, 0)
     base_port = Keyword.get(opts, :base_port, 7100)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+    control_host = Keyword.get(opts, :control_host)
     loadmodule = Keyword.get(opts, :loadmodule, [])
 
     if Map.has_key?(state.instances, name) do
@@ -159,6 +164,7 @@ defmodule RedisServerWrapper.Manager do
         replicas_per_master: replicas,
         base_port: base_port,
         bind: bind,
+        control_host: control_host,
         password: password,
         managed: false,
         loadmodule: loadmodule
@@ -182,11 +188,11 @@ defmodule RedisServerWrapper.Manager do
             name: name,
             type: :cluster,
             created_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-            bind: bind,
+            bind: cluster_info.control_host,
             ports: ports,
             pids: os_pids,
             password: password,
-            url: build_url(bind, base_port, password),
+            url: build_url(cluster_info.control_host, base_port, password),
             metadata: %{
               masters: masters,
               replicas_per_master: replicas
@@ -233,6 +239,7 @@ defmodule RedisServerWrapper.Manager do
     quorum = Keyword.get(opts, :quorum, min(2, num_sentinels))
     sentinel_base_port = Keyword.get(opts, :sentinel_base_port, 26_389)
     bind = Keyword.get(opts, :bind, "127.0.0.1")
+    control_host = Keyword.get(opts, :control_host)
     loadmodule = Keyword.get(opts, :loadmodule, [])
 
     if Map.has_key?(state.instances, name) do
@@ -245,6 +252,7 @@ defmodule RedisServerWrapper.Manager do
         quorum: quorum,
         sentinel_base_port: sentinel_base_port,
         bind: bind,
+        control_host: control_host,
         password: password,
         managed: false,
         loadmodule: loadmodule
@@ -281,11 +289,11 @@ defmodule RedisServerWrapper.Manager do
             name: name,
             type: :sentinel,
             created_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-            bind: bind,
+            bind: sen_info.control_host,
             ports: all_redis_ports ++ sentinel_ports,
             pids: redis_pids ++ sentinel_pids,
             password: password,
-            url: build_url(bind, master_port, password),
+            url: build_url(sen_info.control_host, master_port, password),
             metadata: %{
               master_name: sen_info.master_name,
               master_port: master_port,
