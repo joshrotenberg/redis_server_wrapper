@@ -31,6 +31,7 @@ defmodule RedisServerWrapper.Sentinel do
     * `:password` - Redis password
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * `:timeout` - startup timeout per node in ms (default: 10_000)
     * `:loadmodule` - modules loaded into the master and every replica; accepts
       paths or `{path, [args]}` tuples (default: `[]`). Sentinel processes do
@@ -139,39 +140,40 @@ defmodule RedisServerWrapper.Sentinel do
       |> Config.control_host()
 
     password = Keyword.get(opts, :password)
-
-    redis_server_bin =
-      Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
-
+    distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     loadmodule = Keyword.get(opts, :loadmodule, [])
     managed = Keyword.get(opts, :managed, true)
 
-    node_opts = %{
-      bind: bind,
-      control_host: control_host,
-      password: password,
-      redis_server_bin: redis_server_bin,
-      redis_cli_bin: redis_cli_bin,
-      timeout: timeout,
-      loadmodule: loadmodule,
-      managed: managed
-    }
-
-    validation_settings = %{
-      master_port: master_port,
-      replicas: num_replicas,
-      replica_base_port: replica_base_port,
-      sentinels: num_sentinels,
-      sentinel_base_port: sentinel_base_port,
-      quorum: quorum,
-      down_after_ms: down_after_ms,
-      failover_timeout_ms: failover_timeout_ms,
-      timeout: timeout
-    }
-
-    with :ok <- validate_options(validation_settings),
+    with :ok <- Server.validate_distribution(distribution),
+         redis_server_bin =
+           Keyword.get_lazy(opts, :redis_server_bin, fn ->
+             Server.default_server_bin(distribution)
+           end),
+         node_opts = %{
+           bind: bind,
+           control_host: control_host,
+           password: password,
+           distribution: distribution,
+           redis_server_bin: redis_server_bin,
+           redis_cli_bin: redis_cli_bin,
+           timeout: timeout,
+           loadmodule: loadmodule,
+           managed: managed
+         },
+         validation_settings = %{
+           master_port: master_port,
+           replicas: num_replicas,
+           replica_base_port: replica_base_port,
+           sentinels: num_sentinels,
+           sentinel_base_port: sentinel_base_port,
+           quorum: quorum,
+           down_after_ms: down_after_ms,
+           failover_timeout_ms: failover_timeout_ms,
+           timeout: timeout
+         },
+         :ok <- validate_options(validation_settings),
          {:ok, master_pid} <- start_master(master_port, node_opts),
          {:ok, replica_pids} <-
            start_replicas(num_replicas, replica_base_port, master_port, node_opts),
@@ -339,6 +341,7 @@ defmodule RedisServerWrapper.Sentinel do
       bind: node_opts.bind,
       control_host: node_opts.control_host,
       password: node_opts.password,
+      distribution: node_opts.distribution,
       redis_server_bin: node_opts.redis_server_bin,
       redis_cli_bin: node_opts.redis_cli_bin,
       timeout: node_opts.timeout,
@@ -360,6 +363,7 @@ defmodule RedisServerWrapper.Sentinel do
           bind: node_opts.bind,
           control_host: node_opts.control_host,
           password: node_opts.password,
+          distribution: node_opts.distribution,
           masterauth: node_opts.password,
           replicaof: {node_opts.control_host, master_port},
           redis_server_bin: node_opts.redis_server_bin,

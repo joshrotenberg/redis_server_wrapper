@@ -212,6 +212,7 @@ defmodule RedisServerWrapperTest do
       assert info.port == 6400
       assert info.pid != nil
       assert info.detached == false
+      assert info.distribution == :core
 
       assert {:ok, "OK"} = Server.run(server, ["SET", "mykey", "myvalue"])
       assert {:ok, "myvalue"} = Server.run(server, ["GET", "mykey"])
@@ -251,6 +252,24 @@ defmodule RedisServerWrapperTest do
         assert Server.cli(server).host == "127.0.0.1"
       after
         Server.stop(server)
+      end
+    end
+
+    test "loads the version-matrix module when the compatibility job provides it" do
+      case System.get_env("REDIS_TEST_MODULE") do
+        nil ->
+          :ok
+
+        module_path ->
+          {:ok, server} = Server.start_link(port: 6406, loadmodule: [module_path])
+
+          try do
+            assert Server.ping(server)
+            assert {:ok, modules} = Server.run(server, ["MODULE", "LIST"])
+            assert modules =~ "wrapper_version_matrix"
+          after
+            Server.stop(server)
+          end
       end
     end
 

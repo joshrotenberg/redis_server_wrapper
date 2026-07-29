@@ -30,6 +30,7 @@ defmodule RedisServerWrapper.Cluster do
     * `:password` - Redis password (default: nil)
     * `:redis_server_bin` - redis-server binary path
     * `:redis_cli_bin` - redis-cli binary path
+    * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * `:timeout` - startup timeout per node in ms (default: 10_000)
     * `:cluster_node_timeout` - cluster node timeout in ms (default: 5000)
     * `:loadmodule` - modules loaded into every cluster node; accepts paths or
@@ -128,10 +129,7 @@ defmodule RedisServerWrapper.Cluster do
       |> Config.control_host()
 
     password = Keyword.get(opts, :password)
-
-    redis_server_bin =
-      Keyword.get_lazy(opts, :redis_server_bin, &RedisServerWrapper.Server.default_server_bin/0)
-
+    distribution = Keyword.get(opts, :distribution, :core)
     redis_cli_bin = Keyword.get(opts, :redis_cli_bin, "redis-cli")
     timeout = Keyword.get(opts, :timeout, 10_000)
     cluster_node_timeout = Keyword.get(opts, :cluster_node_timeout, 5000)
@@ -139,24 +137,30 @@ defmodule RedisServerWrapper.Cluster do
     extra = Keyword.get(opts, :extra, [])
     managed = Keyword.get(opts, :managed, true)
 
-    settings = %{
-      masters: masters,
-      replicas_per_master: replicas,
-      base_port: base_port,
-      bind: bind,
-      control_host: control_host,
-      password: password,
-      redis_server_bin: redis_server_bin,
-      redis_cli_bin: redis_cli_bin,
-      timeout: timeout,
-      cluster_node_timeout: cluster_node_timeout,
-      loadmodule: loadmodule,
-      extra: extra,
-      managed: managed
-    }
-
-    case validate_options(settings) do
-      :ok -> start_validated_cluster(settings)
+    with :ok <- Server.validate_distribution(distribution),
+         redis_server_bin =
+           Keyword.get_lazy(opts, :redis_server_bin, fn ->
+             Server.default_server_bin(distribution)
+           end),
+         settings = %{
+           masters: masters,
+           replicas_per_master: replicas,
+           base_port: base_port,
+           bind: bind,
+           control_host: control_host,
+           password: password,
+           distribution: distribution,
+           redis_server_bin: redis_server_bin,
+           redis_cli_bin: redis_cli_bin,
+           timeout: timeout,
+           cluster_node_timeout: cluster_node_timeout,
+           loadmodule: loadmodule,
+           extra: extra,
+           managed: managed
+         },
+         :ok <- validate_options(settings) do
+      start_validated_cluster(settings)
+    else
       {:error, reason} -> {:stop, reason}
     end
   end
@@ -269,6 +273,7 @@ defmodule RedisServerWrapper.Cluster do
         :bind,
         :control_host,
         :password,
+        :distribution,
         :redis_server_bin,
         :redis_cli_bin,
         :timeout,
@@ -331,6 +336,7 @@ defmodule RedisServerWrapper.Cluster do
             bind: node_opts.bind,
             control_host: node_opts.control_host,
             password: node_opts.password,
+            distribution: node_opts.distribution,
             redis_server_bin: node_opts.redis_server_bin,
             redis_cli_bin: node_opts.redis_cli_bin,
             timeout: node_opts.timeout,

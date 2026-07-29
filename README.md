@@ -41,6 +41,36 @@ sudo apt-get install redis-server
 redis-server --version
 ```
 
+### Supported Redis versions and distributions
+
+The supported Redis lines are 7.2, 7.4, 8.2, and the latest Redis 8.x release.
+CI runs the full standalone, Cluster, and Sentinel suite against a current patch
+release from each line, including a custom-module startup test. New patch
+releases within those lines are supported; older releases may work but are not
+part of the compatibility contract.
+
+Startup uses the core `redis-server` on PATH by default:
+
+```elixir
+# Redis Open Source / core (default)
+RedisServerWrapper.start_server(distribution: :core)
+
+# Redis 8 full distribution; modules are managed by Redis itself
+RedisServerWrapper.start_server(distribution: :full)
+
+# Legacy Redis Stack only; enables sibling-module discovery
+RedisServerWrapper.start_server(
+  distribution: :legacy_stack,
+  redis_server_bin: "/path/to/redis-stack/bin/redis-server"
+)
+```
+
+An explicit `:redis_server_bin` always wins. Legacy Stack selection can also use
+the `REDIS_LEGACY_STACK_SERVER_BIN` environment variable. The wrapper never
+silently switches distributions, and it only discovers sibling Stack modules
+when `distribution: :legacy_stack` is explicit. Caller-provided `:loadmodule`
+entries work with every distribution.
+
 ## Quick Start
 
 ### Single Server

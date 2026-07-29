@@ -175,6 +175,23 @@ defmodule RedisServerWrapperUnitTest do
   end
 
   test "top-level availability and version helpers cover every result shape", context do
+    assert Server.default_server_bin() == "redis-server"
+    assert Server.default_server_bin(:core) == "redis-server"
+    assert Server.default_server_bin(:full) == "redis-server"
+
+    original_legacy_bin = System.get_env("REDIS_LEGACY_STACK_SERVER_BIN")
+    System.put_env("REDIS_LEGACY_STACK_SERVER_BIN", context.version_bin)
+
+    on_exit(fn ->
+      if original_legacy_bin do
+        System.put_env("REDIS_LEGACY_STACK_SERVER_BIN", original_legacy_bin)
+      else
+        System.delete_env("REDIS_LEGACY_STACK_SERVER_BIN")
+      end
+    end)
+
+    assert Server.default_server_bin(:legacy_stack) == context.version_bin
+
     assert RedisServerWrapper.available?(context.version_bin)
     refute RedisServerWrapper.available?("definitely-missing-redis-binary")
 
@@ -194,11 +211,44 @@ defmodule RedisServerWrapperUnitTest do
     assert {:error, {:binary_not_found, "missing-redis-cli"}} =
              Server.start(redis_cli_bin: "missing-redis-cli")
 
+    assert {:error, {:invalid_distribution, :unknown}} =
+             Server.start(distribution: :unknown)
+
     assert {:error, {:server_start_failed, 6440, _status, _output}} =
              Server.start(port: 6440, managed: false, redis_server_bin: "false")
 
     assert {:error, {:server_start_timeout, 6441}} =
              Server.start(port: 6441, managed: true, redis_server_bin: "false", timeout: 20)
+  end
+
+  test "legacy Stack module discovery is explicit", %{fixture_dir: fixture_dir} do
+    prefix = Path.join(fixture_dir, "legacy-stack")
+    bin_dir = Path.join(prefix, "bin")
+    lib_dir = Path.join(prefix, "lib")
+    File.mkdir_p!(bin_dir)
+    File.mkdir_p!(lib_dir)
+
+    redis_server = Path.join(bin_dir, "redis-server")
+    File.ln_s!(System.find_executable("redis-server"), redis_server)
+    File.write!(Path.join(lib_dir, "rediscompat.so"), "not a module")
+
+    {:ok, core_server} =
+      Server.start_link(
+        port: 6492,
+        redis_server_bin: redis_server,
+        distribution: :core
+      )
+
+    assert Server.ping(core_server)
+    assert Server.stop(core_server) == :ok
+
+    assert {:error, {:server_start_timeout, 6493}} =
+             Server.start(
+               port: 6493,
+               redis_server_bin: redis_server,
+               distribution: :legacy_stack,
+               timeout: 100
+             )
   end
 
   test "OS process helpers normalize executable results", %{fixture_dir: fixture_dir} do
@@ -298,6 +348,9 @@ defmodule RedisServerWrapperUnitTest do
   end
 
   test "cluster validates counts, ports, and timeouts before startup" do
+    assert {:error, {:invalid_distribution, :unknown}} =
+             Cluster.start(distribution: :unknown)
+
     assert {:error, {:invalid_option, :masters, 0}} = Cluster.start(masters: 0)
 
     assert {:error, {:invalid_option, :replicas_per_master, -1}} =
@@ -318,6 +371,9 @@ defmodule RedisServerWrapperUnitTest do
   end
 
   test "sentinel validates counts, quorum, ports, and timeouts before startup" do
+    assert {:error, {:invalid_distribution, :unknown}} =
+             Sentinel.start(distribution: :unknown)
+
     assert {:error, {:invalid_option, :replicas, -1}} = Sentinel.start(replicas: -1)
     assert {:error, {:invalid_option, :sentinels, 0}} = Sentinel.start(sentinels: 0)
     assert {:error, {:invalid_quorum, 4, 3}} = Sentinel.start(quorum: 4)

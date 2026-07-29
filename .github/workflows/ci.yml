@@ -19,8 +19,10 @@ jobs:
         include:
           - elixir: "1.19"
             otp: "27"
+            redis: "7.2.14"
           - elixir: "1.20"
             otp: "29"
+            redis: "7.2.14"
 
     steps:
       - uses: actions/checkout@v7
@@ -30,11 +32,22 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
-      - name: Install Redis
+      - name: Cache Redis
+        id: redis-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/redis-server-wrapper/redis-${{ matrix.redis }}
+          key: redis-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
+
+      - name: Build Redis ${{ matrix.redis }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y redis-server
-          redis-server --version
+          bash .github/scripts/build-redis.sh \
+            "${{ matrix.redis }}" \
+            "${HOME}/.cache/redis-server-wrapper/redis-${{ matrix.redis }}"
+          echo "${HOME}/.cache/redis-server-wrapper/redis-${{ matrix.redis }}/bin" >> "${GITHUB_PATH}"
+
+      - name: Report Redis version
+        run: redis-server --version
 
       - name: Restore deps cache
         uses: actions/cache@v6
@@ -80,6 +93,59 @@ jobs:
       - name: Run tests with coverage gate
         if: matrix.elixir == '1.20' && matrix.otp == '29'
         run: mix test --cover
+
+  redis-compatibility:
+    name: Redis ${{ matrix.redis }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["7.2.14", "7.4.9", "8.2.6", "8.8.0"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "27"
+
+      - name: Cache Redis
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/redis-server-wrapper/redis-${{ matrix.redis }}
+          key: redis-${{ runner.os }}-${{ runner.arch }}-${{ matrix.redis }}
+
+      - name: Build Redis ${{ matrix.redis }}
+        run: |
+          bash .github/scripts/build-redis.sh \
+            "${{ matrix.redis }}" \
+            "${HOME}/.cache/redis-server-wrapper/redis-${{ matrix.redis }}"
+          echo "${HOME}/.cache/redis-server-wrapper/redis-${{ matrix.redis }}/bin" >> "${GITHUB_PATH}"
+          echo "REDIS_PREFIX=${HOME}/.cache/redis-server-wrapper/redis-${{ matrix.redis }}" >> "${GITHUB_ENV}"
+
+      - name: Build version-matrix module
+        run: |
+          cc -fPIC -shared \
+            -I "${REDIS_PREFIX}/include" \
+            test/support/version_matrix_module.c \
+            -o "${RUNNER_TEMP}/version_matrix_module.so"
+          echo "REDIS_TEST_MODULE=${RUNNER_TEMP}/version_matrix_module.so" >> "${GITHUB_ENV}"
+
+      - name: Report Redis version
+        run: redis-server --version
+
+      - name: Restore deps cache
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: compat-deps-1.19-27-${{ hashFiles('mix.lock') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run standalone, Cluster, Sentinel, and module tests
+        run: mix test
 
   docs:
     name: Docs
