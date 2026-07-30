@@ -20,6 +20,17 @@ def deps do
 end
 ```
 
+## Documentation
+
+- [Support policy](guides/support.md) — Redis, Elixir/OTP, OS, distribution,
+  transport, and external-module compatibility.
+- [Configuration reference](guides/configuration.md) — complete
+  Config/Server/Cluster/Sentinel/Manager option matrices.
+- [Security and data safety](guides/security.md) — credentials, generated
+  files, network exposure, process arguments, and destructive operations.
+- [Testing and troubleshooting](guides/testing.md) — ExUnit fixtures, parallel
+  port allocation, topology port ranges, custom modules, and failure diagnosis.
+
 ## Prerequisites
 
 You need `redis-server` and `redis-cli` installed and available on your PATH.
@@ -48,6 +59,11 @@ CI runs the full standalone, Cluster, and Sentinel suite against a current patch
 release from each line, including a custom-module startup test. New patch
 releases within those lines are supported; older releases may work but are not
 part of the compatibility contract.
+
+CI verifies Linux, Elixir 1.19 / OTP 27, and Elixir 1.20 / OTP 29. macOS is
+supported for local development and maintainer-tested; native Windows is not
+supported. See the [support policy](guides/support.md) for the complete
+compatibility and platform contract.
 
 Startup uses the core `redis-server` on PATH by default:
 
@@ -149,6 +165,10 @@ BEAM instances must not write to the same Manager state file concurrently.
 Invalid state is moved aside as an `instances.json.corrupt-*` recovery copy
 instead of being overwritten.
 
+Manager state contains plaintext credentials. Review
+[security and data safety](guides/security.md) before sharing a state path or
+binding an instance beyond loopback.
+
 ### Managed Process Lifecycle
 
 `Server.start_link/1` accepts a `:managed` option controlling how the
@@ -239,6 +259,15 @@ The original raw directive form remains supported for compatibility, such as
 `loadmodule: ["/path/module.so events expired"]`, but the structured form is
 recommended when arguments are present.
 
+The repository compiles a minimal module and runs both its integration test and
+the shipped generic example on every Redis version in CI:
+
+```bash
+REDIS_MODULE=/absolute/path/to/module.so \
+REDIS_MODULE_NAME=my_module \
+  mix run examples/module_loading.exs
+```
+
 For a complete event-stream demo using
 [`redis-event-stream-module`](https://github.com/joshrotenberg/redis-event-stream-module):
 
@@ -247,12 +276,24 @@ EVENT_STREAM_MODULE=/absolute/path/to/libredis_event_stream_module.so \
   mix run examples/event_stream.exs
 ```
 
+Redis modules are native libraries and must match the target OS, architecture,
+Redis Module API, and Redis version. Loading is CI-verified with the repository's
+minimal module; the external event-stream module must be built separately. See
+[external module support](guides/support.md#external-redis-modules).
+
 ## Configuration
 
-All Redis configuration values are encoded as individual Redis tokens, including
-paths, passwords, module arguments, and `:extra` directives. Use a string for a
-single extra argument or a list for a multi-argument directive. Extras cannot
-override wrapper-owned lifecycle or transport settings such as `port`, `bind`,
+`RedisServerWrapper.Config` is a curated typed subset of Redis configuration,
+not a claim to model every Redis directive. Server, Cluster, and Sentinel add
+operational lifecycle/topology options, while `:extra` is the escape hatch for
+untyped directives. The [configuration reference](guides/configuration.md)
+lists every accepted option and calls out fields that are generated, overridden,
+or intentionally unavailable on a topology.
+
+All values are encoded as individual Redis tokens, including paths, passwords,
+module arguments, and `:extra` directives. Use a string for a single extra
+argument or a list for a multi-argument directive. Extras cannot override
+wrapper-owned lifecycle or transport settings such as `port`, `bind`,
 `daemonize`, `pidfile`, or `dir`.
 
 ```elixir
@@ -394,7 +435,8 @@ Chaos.trigger_failover(replica)        # CLUSTER FAILOVER on a replica
 
 ## Use Cases
 
-- **Testing** -- spin up real Redis instances in ExUnit setup/teardown
+- **Testing** -- spin up real Redis instances using the
+  [ExUnit fixture and port guidance](guides/testing.md)
 - **Development** -- run Redis alongside your app without system services
 - **CI** -- no Docker layer needed, just install redis-server
 - **Cluster/Sentinel testing** -- create full topologies in a single function call

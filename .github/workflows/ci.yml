@@ -147,6 +147,12 @@ jobs:
       - name: Run standalone, Cluster, Sentinel, and module tests
         run: mix test
 
+      - name: Run shipped module-loading example
+        env:
+          REDIS_MODULE: ${{ env.REDIS_TEST_MODULE }}
+          REDIS_MODULE_NAME: wrapper_version_matrix
+        run: mix run examples/module_loading.exs
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
