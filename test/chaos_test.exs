@@ -41,7 +41,7 @@ defmodule RedisServerWrapper.ChaosTest do
 
       %{pid: os_pid} = Server.info(server)
       monitor = Process.monitor(server)
-      Chaos.kill_node(server)
+      assert :ok = Chaos.kill_node(server)
 
       assert_receive {:DOWN, ^monitor, :process, ^server, {:redis_server_exit, :port, _}},
                      5_000
@@ -63,7 +63,7 @@ defmodule RedisServerWrapper.ChaosTest do
       assert process_stopped?(os_pid)
 
       # Resume and verify it responds again
-      Chaos.resume_node(os_pid)
+      assert :ok = Chaos.resume_node(os_pid)
       assert wait_until(fn -> direct_ping(6451) end, 5, 500)
 
       Server.stop(server)
@@ -126,7 +126,7 @@ defmodule RedisServerWrapper.ChaosTest do
     test "fills node with dummy keys" do
       {:ok, server} = Server.start_link(port: 6455)
 
-      Chaos.fill_memory(server, 100)
+      assert :ok = Chaos.fill_memory(server, 100)
 
       {:ok, count} = Server.run(server, ["DBSIZE"])
       assert String.to_integer(count) == 100
@@ -214,7 +214,7 @@ defmodule RedisServerWrapper.ChaosTest do
       end)
 
       # Recover using returned OS pids
-      Chaos.recover(frozen_os_pids)
+      assert :ok = Chaos.recover(frozen_os_pids)
 
       # Wait for all nodes to become responsive
       all_ports = active_ports ++ Enum.map(frozen_info, &elem(&1, 0))
@@ -342,7 +342,7 @@ defmodule RedisServerWrapper.ChaosTest do
       end)
 
       # Recover all
-      Chaos.recover(os_pids)
+      assert :ok = Chaos.recover(os_pids)
 
       # Wait for all nodes to become responsive
       assert wait_until(fn -> Enum.all?(ports, &direct_ping/1) end, 10, 1000)
