@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.4](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.3...v0.7.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* encode redis configuration safely ([#66](https://github.com/joshrotenberg/redis_server_wrapper/issues/66)) ([45a859c](https://github.com/joshrotenberg/redis_server_wrapper/commit/45a859c00e548debd421ddba8e7a07299268bb4f))
+* harden chaos operations and cluster parsing ([#70](https://github.com/joshrotenberg/redis_server_wrapper/issues/70)) ([9b8c913](https://github.com/joshrotenberg/redis_server_wrapper/commit/9b8c91355e0515642b36b8c944cfbeedb57093e9))
+* harden manager credential handling ([#65](https://github.com/joshrotenberg/redis_server_wrapper/issues/65)) ([ecafea6](https://github.com/joshrotenberg/redis_server_wrapper/commit/ecafea686c260c6b1d6ea808667c74c2ad7136b5))
+* make topology cleanup ownership-safe ([#63](https://github.com/joshrotenberg/redis_server_wrapper/issues/63)) ([e943b5e](https://github.com/joshrotenberg/redis_server_wrapper/commit/e943b5e3774c9610a42c71e41f2009e1729272f4))
+* make topology lifecycle reflect child exits ([#69](https://github.com/joshrotenberg/redis_server_wrapper/issues/69)) ([00d5674](https://github.com/joshrotenberg/redis_server_wrapper/commit/00d5674743768f6663dccd5a5a7f09119fdc9c86))
+
 ## [0.7.3](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.2...v0.7.3) (2026-07-29)
 
 
