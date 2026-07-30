@@ -30,7 +30,8 @@ defmodule RedisServerWrapper do
     * **Custom binaries** - point to any `redis-server`/`redis-cli` path
     * **Custom modules** - load modules with argument-safe configuration on
       standalone servers, cluster nodes, and sentinel data nodes
-    * **Arbitrary config** - pass any Redis directive via `:extra` option
+    * **Untyped config escape hatch** - pass additional non-reserved Redis
+      directives via the token-safe `:extra` option
   """
 
   alias RedisServerWrapper.{Cluster, Sentinel, Server}

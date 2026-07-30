@@ -42,14 +42,25 @@ defmodule RedisServerWrapper.MixProject do
     [
       licenses: ["MIT", "Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib examples .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
+      files: ~w(lib examples guides .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "LICENSE"],
+      extras: [
+        "README.md",
+        "guides/support.md",
+        "guides/configuration.md",
+        "guides/security.md",
+        "guides/testing.md",
+        "CHANGELOG.md",
+        "LICENSE"
+      ],
+      groups_for_extras: [
+        Guides: ~r/guides\//
+      ],
       source_ref: "v#{@version}",
       source_url: @source_url
     ]

@@ -79,7 +79,7 @@ defmodule RedisServerWrapper.Manager do
     * `:loadmodule` - modules to load; accepts paths or `{path, [args]}` tuples
     * `:distribution` - `:core` (default), `:full`, or `:legacy_stack`
     * TCP, Unix-socket, and TLS options accepted by `RedisServerWrapper.Server`
-    * Plus any `RedisServerWrapper.Config` options via `:extra`
+    * Additional non-reserved Redis directives via `:extra`
   """
   @spec start_basic(keyword()) :: {:ok, instance()} | {:error, term()}
   def start_basic(opts \\ []) do

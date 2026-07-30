@@ -1,13 +1,14 @@
 alias RedisServerWrapper.Server
 
 module_path =
-  System.get_env("EVENT_STREAM_MODULE") ||
-    raise """
-    Set EVENT_STREAM_MODULE to the absolute path of redis-event-stream-module.
+  (System.get_env("EVENT_STREAM_MODULE") ||
+     raise("""
+     Set EVENT_STREAM_MODULE to the path of redis-event-stream-module.
 
-        EVENT_STREAM_MODULE=/path/to/libredis_event_stream_module.so \
-          mix run examples/event_stream.exs
-    """
+         EVENT_STREAM_MODULE=/path/to/libredis_event_stream_module.so \
+           mix run examples/event_stream.exs
+     """))
+  |> Path.expand()
 
 unless File.regular?(module_path) do
   raise "EVENT_STREAM_MODULE does not point to a file: #{module_path}"

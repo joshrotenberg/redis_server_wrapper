@@ -14,7 +14,11 @@ defmodule RedisServerWrapper.Server do
 
   ## Options
 
-  All options from `RedisServerWrapper.Config` are supported, plus:
+  Typed options from `RedisServerWrapper.Config` are supported, subject to
+  Server-owned lifecycle fields. In particular, Server owns `:daemonize`,
+  `:pidfile`, and `:dir`, and interprets `:timeout` as its startup timeout
+  rather than Redis's idle-client directive. The shipped configuration guide
+  is the authoritative option matrix.
 
     * `:redis_server_bin` - path to redis-server binary (default: "redis-server")
     * `:redis_cli_bin` - path to redis-cli binary (default: "redis-cli")
