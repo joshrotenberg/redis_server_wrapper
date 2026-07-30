@@ -2,6 +2,7 @@ defmodule RedisServerWrapperUnitTest do
   use ExUnit.Case, async: false
 
   alias RedisServerWrapper.{
+    Chaos,
     Cli,
     Cluster,
     Connection,
@@ -11,6 +12,26 @@ defmodule RedisServerWrapperUnitTest do
     Sentinel,
     Server
   }
+
+  defmodule FakeEndpoint do
+    use GenServer
+
+    def start_link(replies), do: GenServer.start_link(__MODULE__, replies)
+
+    @impl true
+    def init(replies), do: {:ok, replies}
+
+    @impl true
+    def handle_call(request, _from, replies) do
+      reply =
+        case Map.fetch(replies, request) do
+          {:ok, reply} -> reply
+          :error when is_tuple(request) -> Map.fetch!(replies, elem(request, 0))
+        end
+
+      {:reply, reply, replies}
+    end
+  end
 
   setup do
     fixture_dir =
@@ -204,6 +225,138 @@ defmodule RedisServerWrapperUnitTest do
 
     assert {:error, "sentinel-error"} =
              Cli.sentinel_master(Cli.new(bin: bin, host: "error"), "mymaster")
+  end
+
+  test "chaos memory fill validates counts without issuing zero writes" do
+    assert :ok = Chaos.fill_memory(self(), 0)
+    assert {:error, {:invalid_key_count, -1}} = Chaos.fill_memory(self(), -1)
+    assert {:error, {:invalid_key_count, 1.5}} = Chaos.fill_memory(self(), 1.5)
+    assert {:error, {:invalid_duration, -1}} = Chaos.pause_node(self(), -1)
+
+    {:ok, failing_server} = FakeEndpoint.start_link(%{run: {:error, "write failed"}})
+
+    assert {:error, {:fill_failed, 1, "write failed"}} =
+             Chaos.fill_memory(failing_server)
+  end
+
+  test "chaos node signals report missing, dead, invalid, and unavailable processes" do
+    {:ok, missing_pid_server} = FakeEndpoint.start_link(%{info: %{pid: nil}})
+    {:ok, dead_pid_server} = FakeEndpoint.start_link(%{info: %{pid: 2_147_483_647}})
+    {:ok, absent_pid_server} = FakeEndpoint.start_link(%{info: %{}})
+
+    assert {:error, :missing_os_pid} = Chaos.kill_node(missing_pid_server)
+
+    assert {:error, {:process_not_alive, 2_147_483_647}} =
+             Chaos.freeze_node(dead_pid_server)
+
+    assert {:error, {:invalid_server_info, %{}}} = Chaos.kill_node(absent_pid_server)
+    assert {:error, {:invalid_os_pid, 0}} = Chaos.resume_node(0)
+    assert {:error, [{0, {:invalid_os_pid, 0}}]} = Chaos.recover([0])
+    assert {:error, [{:not_a_list, :invalid_pid_list}]} = Chaos.recover(:not_a_list)
+
+    {:ok, stopped_server} = FakeEndpoint.start_link(%{info: %{pid: nil}})
+    GenServer.stop(stopped_server)
+
+    assert {:error, {:server_unavailable, _reason}} = Chaos.kill_node(stopped_server)
+
+    original_path = System.get_env("PATH")
+
+    {:ok, current_pid_server} =
+      FakeEndpoint.start_link(%{info: %{pid: System.pid() |> String.to_integer()}})
+
+    System.put_env("PATH", "")
+
+    try do
+      assert {:error, {:executable_not_found, "kill"}} =
+               Chaos.resume_node(System.pid() |> String.to_integer())
+
+      assert {:error, {:executable_not_found, "kill"}} =
+               Chaos.kill_node(current_pid_server)
+    after
+      restore_path(original_path)
+    end
+  end
+
+  test "chaos cluster operations reject empty and invalid partitions safely" do
+    {:ok, empty_cluster} = FakeEndpoint.start_link(%{nodes: []})
+
+    assert {:error, :empty_cluster} = Chaos.random_kill(empty_cluster)
+    assert {:error, :empty_cluster} = Chaos.partition(empty_cluster, [[]])
+
+    {:ok, cluster} = FakeEndpoint.start_link(%{nodes: [self()]})
+
+    assert {:error, :empty_groups} = Chaos.partition(cluster, [])
+    assert {:error, {:invalid_groups, :invalid}} = Chaos.partition(cluster, :invalid)
+    assert {:error, {:empty_or_invalid_group, 0}} = Chaos.partition(cluster, [[]])
+
+    assert {:error, {:invalid_group_member, 0, :not_a_pid}} =
+             Chaos.partition(cluster, [[:not_a_pid]])
+
+    assert {:error, :duplicate_partition_members} =
+             Chaos.partition(cluster, [[self(), self()]])
+
+    assert {:error, {:partition_membership_mismatch, [expected], [actual]}} =
+             Chaos.partition(cluster, [[cluster]])
+
+    assert expected == self()
+    assert actual == cluster
+    assert {:error, {:invalid_slot, -1}} = Chaos.kill_master(cluster, -1)
+    assert {:error, {:invalid_slot, 16_384}} = Chaos.kill_master(cluster, 16_384)
+
+    {:ok, invalid_keyslot_cluster} = FakeEndpoint.start_link(%{run: {:ok, "not-a-slot"}})
+    {:ok, failed_keyslot_cluster} = FakeEndpoint.start_link(%{run: {:error, "offline"}})
+
+    assert {:error, {:invalid_keyslot_reply, "not-a-slot"}} =
+             Chaos.kill_master(invalid_keyslot_cluster, "key")
+
+    assert {:error, {:keyslot_failed, "offline"}} =
+             Chaos.kill_master(failed_keyslot_cluster, "key")
+
+    {:ok, stopped_cluster} = FakeEndpoint.start_link(%{nodes: []})
+    GenServer.stop(stopped_cluster)
+
+    assert {:error, {:cluster_unavailable, _reason}} = Chaos.random_kill(stopped_cluster)
+  end
+
+  test "chaos cluster parser supports IPv6 and ignores transitional slot markers" do
+    cluster_nodes = """
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa [::1]:7000@17000 master - 0 0 1 connected 0-5000 [5001->-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb]
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2001:db8::2:7001@17001,redis-two master - 0 0 2 connected [5001-<-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] 5001-10000
+    cccccccccccccccccccccccccccccccccccccccc redis.example:7002@17002 master,fail - 0 0 3 connected 10001-16383
+    dddddddddddddddddddddddddddddddddddddddd 127.0.0.1:7003@17003 slave aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 4 connected 12000
+    """
+
+    assert {:ok, {"::1", 7000}} = Chaos.master_addr_for_slot(cluster_nodes, 0)
+    assert {:ok, {"2001:db8::2", 7001}} = Chaos.master_addr_for_slot(cluster_nodes, 5_001)
+
+    assert {:error, {:slot_not_found, 12_000}} =
+             Chaos.master_addr_for_slot(cluster_nodes, 12_000)
+
+    malformed_slots =
+      "node redis.example:7000@17000 master - 0 0 1 connected banana 20-nope 50-10"
+
+    assert {:error, {:slot_not_found, 20}} =
+             Chaos.master_addr_for_slot(malformed_slots, 20)
+
+    malformed_address = "node no-port master - 0 0 1 connected 20"
+
+    assert {:error, {:invalid_node_address, "no-port"}} =
+             Chaos.master_addr_for_slot(malformed_address, 20)
+
+    assert {:error, {:invalid_node_address, "[::1]bad"}} =
+             Chaos.master_addr_for_slot("node [::1]bad master - 0 0 1 connected 20", 20)
+
+    assert {:error, {:invalid_node_address, ":7000"}} =
+             Chaos.master_addr_for_slot("node :7000 master - 0 0 1 connected 20", 20)
+
+    assert {:error, {:invalid_node_address, "redis.example:bad"}} =
+             Chaos.master_addr_for_slot(
+               "node redis.example:bad master - 0 0 1 connected 20",
+               20
+             )
+
+    assert {:error, {:invalid_slot, 16_384}} =
+             Chaos.master_addr_for_slot(cluster_nodes, 16_384)
   end
 
   test "private file helpers create, replace, and harden filesystem state", %{
