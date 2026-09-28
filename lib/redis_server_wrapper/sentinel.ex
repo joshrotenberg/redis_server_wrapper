@@ -57,6 +57,7 @@ defmodule RedisServerWrapper.Sentinel do
     Cli,
     Config,
     Connection,
+    Lifecycle,
     ManagedProcess,
     OSProcess,
     SecureFile,
@@ -128,9 +129,14 @@ defmodule RedisServerWrapper.Sentinel do
   @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
-  @doc "Stops the sentinel topology."
+  @doc """
+  Stops the sentinel topology.
+
+  Idempotent: returns `:ok` even if `server` is already stopped, was never
+  registered, or exits concurrently with this call.
+  """
   @spec stop(GenServer.server()) :: :ok
-  def stop(server), do: GenServer.stop(server, :normal)
+  def stop(server), do: Lifecycle.stop_process(server)
 
   # -------------------------------------------------------------------
   # GenServer callbacks
