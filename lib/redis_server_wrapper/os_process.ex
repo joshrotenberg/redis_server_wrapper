@@ -94,6 +94,12 @@ defmodule RedisServerWrapper.OSProcess do
     end
   end
 
+  @doc false
+  @spec pids_on_port_args(:inet.port_number()) :: [String.t()]
+  def pids_on_port_args(port) when is_integer(port) and port >= 0 and port <= 65_535 do
+    ["-nP", "-ti", "tcp:#{port}", "-sTCP:LISTEN"]
+  end
+
   @spec pids_on_port(:inet.port_number()) ::
           {:ok, [pos_integer()]} | {:error, {:executable_not_found, String.t()}}
   def pids_on_port(port) when is_integer(port) and port >= 0 and port <= 65_535 do
@@ -102,7 +108,7 @@ defmodule RedisServerWrapper.OSProcess do
         {:error, {:executable_not_found, "lsof"}}
 
       lsof ->
-        case System.cmd(lsof, ["-ti", ":#{port}"], stderr_to_stdout: true) do
+        case System.cmd(lsof, pids_on_port_args(port), stderr_to_stdout: true) do
           {output, 0} ->
             pids =
               output
