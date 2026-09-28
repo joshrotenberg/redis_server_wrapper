@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.5](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.4...v0.7.5) (2026-09-28)
+
+
+### Bug Fixes
+
+* guard process-group kill against pid misparse ([#77](https://github.com/joshrotenberg/redis_server_wrapper/issues/77)) ([e33248f](https://github.com/joshrotenberg/redis_server_wrapper/commit/e33248fe32ccb991b30629cfac567ac42f3be844))
+* make stop idempotent and wait for confirmed exit ([#80](https://github.com/joshrotenberg/redis_server_wrapper/issues/80)) ([64a2c15](https://github.com/joshrotenberg/redis_server_wrapper/commit/64a2c15c1b20316f16b2947dfa05b8b5fcdf97ba))
+* match only listening sockets when resolving port owners ([#78](https://github.com/joshrotenberg/redis_server_wrapper/issues/78)) ([c1477ae](https://github.com/joshrotenberg/redis_server_wrapper/commit/c1477ae6d656e7049094f0c72ed2433720db79cc)), closes [#75](https://github.com/joshrotenberg/redis_server_wrapper/issues/75)
+
 ## [0.7.4](https://github.com/joshrotenberg/redis_server_wrapper/compare/v0.7.3...v0.7.4) (2026-07-30)
 
 
