@@ -536,6 +536,10 @@ defmodule RedisServerWrapperUnitTest do
     assert {:ok, [123, 456]} = OSProcess.pids_on_socket("/tmp/redis.sock")
   end
 
+  test "pids_on_port_args restricts lsof to listening sockets on the port" do
+    assert OSProcess.pids_on_port_args(6400) == ["-nP", "-ti", "tcp:6400", "-sTCP:LISTEN"]
+  end
+
   test "missing kill and lsof do not crash process helpers or normal teardown", %{
     cli_bin: cli_bin
   } do

@@ -46,6 +46,14 @@ defmodule RedisServerWrapperTest do
     end
   end
 
+  defp safe_port_close(port_ref) do
+    if :erlang.port_info(port_ref) != :undefined do
+      Port.close(port_ref)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp redis_cli_wrapper!(dir, mode) do
     path = Path.join(dir, "redis-cli-#{mode}")
 
@@ -482,6 +490,49 @@ defmodule RedisServerWrapperTest do
 
       Server.stop(server)
       Process.sleep(500)
+    end
+
+    test "pids_on_port reports the listening server, not a connected client" do
+      redis_cli_bin = System.find_executable("redis-cli")
+
+      if OSProcess.available?("lsof") and redis_cli_bin do
+        port = 6460
+        {:ok, server} = Server.start_link(port: port)
+        server_os_pid = Server.info(server).pid
+
+        client_port =
+          Port.open({:spawn_executable, redis_cli_bin}, [
+            :binary,
+            :exit_status,
+            args: ["-p", to_string(port), "SUBSCRIBE", "x"]
+          ])
+
+        {:os_pid, client_os_pid} = Port.info(client_port, :os_pid)
+
+        try do
+          assert wait_until(
+                   fn ->
+                     case Server.run(server, ["CLIENT", "LIST"]) do
+                       {:ok, list} -> list |> String.split("\n", trim: true) |> length() >= 2
+                       _other -> false
+                     end
+                   end,
+                   20,
+                   100
+                 )
+
+          assert OSProcess.pids_on_port(port) == {:ok, [server_os_pid]}
+        after
+          if OSProcess.alive?(client_os_pid) do
+            OSProcess.signal(client_os_pid, :kill)
+          end
+
+          safe_port_close(client_port)
+          Server.stop(server)
+        end
+      else
+        :ok
+      end
     end
   end
 
