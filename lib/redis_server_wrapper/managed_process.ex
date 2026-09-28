@@ -3,7 +3,7 @@ defmodule RedisServerWrapper.ManagedProcess do
 
   use GenServer
 
-  alias RedisServerWrapper.OSProcess
+  alias RedisServerWrapper.{Lifecycle, OSProcess}
 
   require Logger
 
@@ -26,8 +26,10 @@ defmodule RedisServerWrapper.ManagedProcess do
   @spec info(GenServer.server()) :: %{backend: backend(), pid: pos_integer() | nil}
   def info(server), do: GenServer.call(server, :info)
 
+  # Idempotent: returns :ok even if `server` is already stopped, was never
+  # registered, or exits concurrently with this call.
   @spec stop(GenServer.server()) :: :ok
-  def stop(server), do: GenServer.stop(server, :normal)
+  def stop(server), do: Lifecycle.stop_process(server)
 
   @impl true
   def init(opts) do

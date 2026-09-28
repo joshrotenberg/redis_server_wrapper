@@ -54,7 +54,7 @@ defmodule RedisServerWrapper.Server do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, Connection, OSProcess, SecureFile}
+  alias RedisServerWrapper.{Cli, Config, Connection, Lifecycle, OSProcess, SecureFile}
 
   require Logger
 
@@ -63,6 +63,15 @@ defmodule RedisServerWrapper.Server do
 
   @default_timeout 10_000
   @legacy_stack_server_env "REDIS_LEGACY_STACK_SERVER_BIN"
+
+  # Bounded wait for the owned redis-server pid to exit after SHUTDOWN
+  # NOSAVE, polled at @exit_poll_interval_ms. Replaces a fixed sleep so
+  # terminate/2 confirms the process (and its listener) are actually gone
+  # before returning, instead of guessing at a delay.
+  @shutdown_wait_ms 5_000
+  # Bounded wait for the owned pid to exit after a SIGKILL force-kill.
+  @force_kill_wait_ms 2_000
+  @exit_poll_interval_ms 50
 
   defstruct [
     :config,
@@ -142,9 +151,14 @@ defmodule RedisServerWrapper.Server do
   @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
-  @doc "Gracefully stops the GenServer (which stops redis-server unless detached)."
+  @doc """
+  Gracefully stops the GenServer (which stops redis-server unless detached).
+
+  Idempotent: returns `:ok` even if `server` is already stopped, was never
+  registered, or exits concurrently with this call.
+  """
   @spec stop(GenServer.server()) :: :ok
-  def stop(server), do: GenServer.stop(server, :normal)
+  def stop(server), do: Lifecycle.stop_process(server)
 
   @doc """
   Returns the default redis-server binary for a distribution.
@@ -334,9 +348,15 @@ defmodule RedisServerWrapper.Server do
         Connection.label(state.cli.connection)
     )
 
+    # A SIGSTOPped redis-server cannot process SHUTDOWN. Resume it first so a
+    # frozen server (e.g. via Chaos.freeze_node/1) can still exit cleanly.
+    owned = owns_pid?(state)
+    if owned, do: OSProcess.signal(state.pid, :cont)
+
     shutdown_if_owned(state)
-    # Give it a moment to shut down
-    Process.sleep(500)
+    # Wait for the owned pid to actually exit rather than guessing at a delay.
+    # A pid we cannot prove is ours is never waited on.
+    if owned, do: wait_for_pid_exit(state.pid, @shutdown_wait_ms)
 
     managed_pid_owned = managed_port_owns_pid?(state.port_ref, state.pid)
 
@@ -739,6 +759,37 @@ defmodule RedisServerWrapper.Server do
     ArgumentError -> :ok
   end
 
+  # Whether the tracked pid is confirmed to be the redis-server we started:
+  # either the managed port's own OS pid, or (unmanaged, no port to ask)
+  # still the pid holding the listener.
+  defp owns_pid?(%{pid: nil}), do: false
+
+  defp owns_pid?(state) do
+    managed_port_owns_pid?(state.port_ref, state.pid) or
+      (is_nil(state.port_ref) and pid_owns_listener?(state.pid, state.cli.connection))
+  end
+
+  defp wait_for_pid_exit(nil, _timeout_ms), do: :ok
+
+  defp wait_for_pid_exit(pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_pid_exit(pid, deadline)
+  end
+
+  defp do_wait_for_pid_exit(pid, deadline) do
+    cond do
+      not OSProcess.alive?(pid) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        :timeout
+
+      true ->
+        Process.sleep(@exit_poll_interval_ms)
+        do_wait_for_pid_exit(pid, deadline)
+    end
+  end
+
   defp shutdown_if_owned(%{pid: nil}), do: :ok
 
   defp shutdown_if_owned(state) do
@@ -827,6 +878,10 @@ defmodule RedisServerWrapper.Server do
 
       # Also try the individual PID in case process group kill didn't work
       warn_if_signal_unavailable(OSProcess.signal(force_kill_pid, :kill), force_kill_pid)
+
+      if wait_for_pid_exit(force_kill_pid, @force_kill_wait_ms) == :timeout do
+        Logger.warning("redis-server PID #{force_kill_pid} still alive after SIGKILL")
+      end
     end
   end
 

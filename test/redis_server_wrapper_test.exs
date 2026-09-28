@@ -2,6 +2,7 @@ defmodule RedisServerWrapperTest do
   use ExUnit.Case, async: false
 
   alias RedisServerWrapper.{
+    Chaos,
     Cli,
     Cluster,
     Config,
@@ -533,6 +534,49 @@ defmodule RedisServerWrapperTest do
       else
         :ok
       end
+    end
+
+    test "stop/1 is idempotent" do
+      {:ok, server} = Server.start_link(port: 6580)
+
+      assert :ok = Server.stop(server)
+      assert :ok = Server.stop(server)
+    end
+
+    test "stop/1 frees the port immediately for reuse" do
+      {:ok, server} = Server.start_link(port: 6582)
+      assert :ok = Server.stop(server)
+
+      assert {:ok, replacement} = Server.start_link(port: 6582)
+      assert Server.ping(replacement)
+      Server.stop(replacement)
+    end
+
+    test "stop/1 confirms exit of a frozen (SIGSTOP) server within the bound" do
+      {:ok, server} = Server.start_link(port: 6583)
+      os_pid = Server.info(server).pid
+
+      assert {:ok, ^os_pid} = Chaos.freeze_node(server)
+
+      {elapsed_us, result} = :timer.tc(fn -> Server.stop(server) end)
+      assert result == :ok
+      assert elapsed_us < 8_000_000
+      refute OSProcess.alive?(os_pid)
+    end
+
+    test "stop/1 on a stale pid after same-port replacement is a no-op for the replacement" do
+      {:ok, server_a} = Server.start_link(port: 6584)
+      assert :ok = Server.stop(server_a)
+
+      {:ok, server_b} = Server.start_link(port: 6584)
+
+      # Calling stop again on the already-stopped GenServer must still
+      # return :ok, and must never touch the replacement server on the
+      # same port.
+      assert :ok = Server.stop(server_a)
+      assert Server.ping(server_b)
+
+      Server.stop(server_b)
     end
   end
 
@@ -1306,6 +1350,14 @@ defmodule RedisServerWrapperTest do
         Cluster.stop(cluster)
       end
     end
+
+    @tag timeout: 30_000
+    test "stop/1 is idempotent" do
+      {:ok, cluster} = Cluster.start_link(masters: 3, base_port: 7150)
+
+      assert :ok = Cluster.stop(cluster)
+      assert :ok = Cluster.stop(cluster)
+    end
   end
 
   describe "Sentinel" do
@@ -1676,6 +1728,21 @@ defmodule RedisServerWrapperTest do
       after
         Sentinel.stop(sentinel)
       end
+    end
+
+    @tag timeout: 30_000
+    test "stop/1 is idempotent" do
+      {:ok, sentinel} =
+        Sentinel.start_link(
+          master_port: 6590,
+          replicas: 0,
+          sentinels: 1,
+          sentinel_base_port: 26_590,
+          quorum: 1
+        )
+
+      assert :ok = Sentinel.stop(sentinel)
+      assert :ok = Sentinel.stop(sentinel)
     end
   end
 

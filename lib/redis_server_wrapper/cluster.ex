@@ -52,7 +52,7 @@ defmodule RedisServerWrapper.Cluster do
 
   use GenServer
 
-  alias RedisServerWrapper.{Cli, Config, Connection, Server}
+  alias RedisServerWrapper.{Cli, Config, Connection, Lifecycle, Server}
 
   require Logger
 
@@ -122,9 +122,14 @@ defmodule RedisServerWrapper.Cluster do
   @spec detach(GenServer.server()) :: :ok | {:error, :managed_server}
   def detach(server), do: GenServer.call(server, :detach)
 
-  @doc "Stops the cluster."
+  @doc """
+  Stops the cluster.
+
+  Idempotent: returns `:ok` even if `server` is already stopped, was never
+  registered, or exits concurrently with this call.
+  """
   @spec stop(GenServer.server()) :: :ok
-  def stop(server), do: GenServer.stop(server, :normal)
+  def stop(server), do: Lifecycle.stop_process(server)
 
   # -------------------------------------------------------------------
   # GenServer callbacks
