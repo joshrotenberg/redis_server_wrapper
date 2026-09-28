@@ -552,7 +552,7 @@ defmodule RedisServerWrapperUnitTest do
 
     refute OSProcess.available?("kill")
     refute OSProcess.available?("lsof")
-    assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(1, :term)
+    assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(999, :term)
     assert {:error, {:executable_not_found, "lsof"}} = OSProcess.pids_on_port(6490)
 
     assert {:error, {:executable_not_found, "lsof"}} =
@@ -560,6 +560,12 @@ defmodule RedisServerWrapperUnitTest do
 
     assert is_boolean(OSProcess.alive?(String.to_integer(System.pid())))
     assert is_boolean(OSProcess.orphaned?(String.to_integer(System.pid())))
+
+    # Without ps, process_group/1 falls back to /proc (Linux) or reports :error.
+    case OSProcess.process_group(String.to_integer(System.pid())) do
+      {:ok, pgid} -> assert is_integer(pgid) and pgid > 0
+      :error -> :ok
+    end
 
     assert {:ok, server} =
              Server.start_link(
