@@ -552,7 +552,7 @@ defmodule RedisServerWrapperUnitTest do
 
     refute OSProcess.available?("kill")
     refute OSProcess.available?("lsof")
-    assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(1, :term)
+    assert {:error, {:executable_not_found, "kill"}} = OSProcess.signal(999, :term)
     assert {:error, {:executable_not_found, "lsof"}} = OSProcess.pids_on_port(6490)
 
     assert {:error, {:executable_not_found, "lsof"}} =

@@ -359,13 +359,7 @@ defmodule RedisServerWrapper.Server do
 
     # Force kill only when ownership was re-established immediately before the
     # signal. Use the process group to also catch children of a custom wrapper.
-    if force_kill_pid && OSProcess.alive?(force_kill_pid) do
-      Logger.warning("redis-server PID #{state.pid} still alive after SHUTDOWN, sending SIGKILL")
-      # Kill the process group (negative PID) to get wrapper + child
-      warn_if_signal_unavailable(OSProcess.signal(-force_kill_pid, :kill), force_kill_pid)
-      # Also try the individual PID in case process group kill didn't work
-      warn_if_signal_unavailable(OSProcess.signal(force_kill_pid, :kill), force_kill_pid)
-    end
+    force_kill_if_alive(force_kill_pid)
 
     :ok
   end
@@ -817,11 +811,34 @@ defmodule RedisServerWrapper.Server do
   defp endpoint_value(%Connection{transport: :unix, socket: socket}), do: {:unix, socket}
   defp endpoint_value(%Connection{port: port}), do: port
 
+  defp force_kill_if_alive(force_kill_pid) do
+    if force_kill_pid && OSProcess.alive?(force_kill_pid) do
+      Logger.warning(
+        "redis-server PID #{force_kill_pid} still alive after SHUTDOWN, sending SIGKILL"
+      )
+
+      # Kill the process group to get wrapper + children, but only when
+      # force_kill_pid is confirmed to be its own group leader. signal_group/2
+      # always passes "--" before the negative pgid argument, so it cannot be
+      # misparsed as a `kill` option the way a bare negative pid could.
+      if OSProcess.process_group(force_kill_pid) == {:ok, force_kill_pid} do
+        warn_if_signal_unavailable(OSProcess.signal_group(force_kill_pid, :kill), force_kill_pid)
+      end
+
+      # Also try the individual PID in case process group kill didn't work
+      warn_if_signal_unavailable(OSProcess.signal(force_kill_pid, :kill), force_kill_pid)
+    end
+  end
+
   defp warn_if_signal_unavailable(
          {:error, {:executable_not_found, "kill"}},
          pid
        ) do
     Logger.warning("kill is unavailable; unable to signal Redis process #{pid}")
+  end
+
+  defp warn_if_signal_unavailable({:error, {:invalid_pid, invalid_pid}}, pid) do
+    Logger.warning("refused to signal Redis process #{pid}: invalid pid #{inspect(invalid_pid)}")
   end
 
   defp warn_if_signal_unavailable(_result, _pid), do: :ok
