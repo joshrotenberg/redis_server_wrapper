@@ -561,6 +561,12 @@ defmodule RedisServerWrapperUnitTest do
     assert is_boolean(OSProcess.alive?(String.to_integer(System.pid())))
     assert is_boolean(OSProcess.orphaned?(String.to_integer(System.pid())))
 
+    # Without ps, process_group/1 falls back to /proc (Linux) or reports :error.
+    case OSProcess.process_group(String.to_integer(System.pid())) do
+      {:ok, pgid} -> assert is_integer(pgid) and pgid > 0
+      :error -> :ok
+    end
+
     assert {:ok, server} =
              Server.start_link(
                port: 6490,

@@ -35,6 +35,18 @@ defmodule RedisServerWrapper.OSProcessTest do
     end
   end
 
+  describe "process_group/1" do
+    # Read-only lookups: these never signal anything.
+    test "reports the process group of the running BEAM" do
+      assert {:ok, pgid} = OSProcess.process_group(String.to_integer(System.pid()))
+      assert is_integer(pgid) and pgid > 0
+    end
+
+    test "returns :error for a pid that does not exist" do
+      assert OSProcess.process_group(2_147_483_000) == :error
+    end
+  end
+
   describe "signal/2 with an invalid pid" do
     test "returns {:error, {:invalid_pid, _}} without touching kill" do
       for pid <- @invalid_pids do
